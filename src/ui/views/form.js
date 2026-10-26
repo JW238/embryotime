@@ -2,6 +2,8 @@
 
 import { html, mount, toast } from '../dom.js';
 import { celebrateSaved } from '../celebrate.js';
+import { attachWheels, durationWheels } from '../wheel.js';
+import { ESTIMATE_METHOD_TEXT, estimateStage } from '../../hh-stages.js';
 import { countdown, emptyState, targetDisplay } from '../components.js';
 import {
   EGG_COUNT_MAX,
@@ -61,14 +63,27 @@ const FOCUS_FOR = {
   name: 'f-name',
   batchId: 'f-batchId',
   eggCount: 'f-eggCount',
-  currentIncubation: 'f-currentHours',
+  currentIncubation: 'f-current-d',
   placement: 'f-placementDate',
   timeZone: 'f-timeZone',
-  wait: 'f-waitHours',
+  wait: 'f-wait-d',
   reminders: 'f-customReminders',
   notes: 'f-notes',
   conditions: 'f-conditions',
 };
+
+const toMinutes = (h, m) => (Number(h) || 0) * 60 + (Number(m) || 0);
+
+/** Estimated HH stage at placement and at target, from the reference ages only. */
+function stageEstimates(atPlacementMinutes, atTargetMinutes) {
+  const a = estimateStage(atPlacementMinutes);
+  const b = estimateStage(atTargetMinutes);
+  return html`<dl class="kv stage-estimates">
+    <dt>Estimated HH stage at placement</dt><dd><strong>${a.label}</strong> <span class="est-tag">estimate</span></dd>
+    <dt>Estimated HH stage at target</dt><dd><strong>${b.label}</strong> <span class="est-tag">estimate</span>
+      <span class="hint block">${ESTIMATE_METHOD_TEXT[b.method]}</span></dd>
+  </dl>`;
+}
 
 const err = (key) => html`<p class="field-error" id="err-${key}" hidden></p>`;
 
@@ -158,10 +173,13 @@ export function renderForm(container, ctx, { mode, uid, from }) {
           <fieldset class="field">
             <legend>Incubation already completed at placement <span class="req" aria-hidden="true">*</span></legend>
             <p class="hint" id="hint-current">Elapsed incubation of the embryo at the moment it is placed in the incubator (e.g. 48 h). Used only for the projected total — it does not change the target time. Enter 0 if incubation starts at placement.</p>
-            <div class="duration-inputs">
-              <label><input id="f-currentHours" name="currentHours" inputmode="numeric" pattern="[0-9]*" value="${input.currentHours}" aria-describedby="hint-current err-currentIncubation"> <span>hours</span></label>
-              <label><input id="f-currentMinutes" name="currentMinutes" inputmode="numeric" pattern="[0-9]*" value="${input.currentMinutes}" placeholder="0" aria-describedby="hint-current err-currentIncubation"> <span>minutes</span></label>
-            </div>
+            ${durationWheels({
+              name: 'current',
+              label: 'Incubation at placement',
+              totalMinutes: toMinutes(input.currentHours, input.currentMinutes),
+              errorKey: 'currentIncubation',
+              describedBy: 'hint-current err-currentIncubation',
+            })}
             ${err('currentIncubation')}
           </fieldset>
 
@@ -181,10 +199,13 @@ export function renderForm(container, ctx, { mode, uid, from }) {
           <fieldset class="field">
             <legend>Required waiting duration <span class="req" aria-hidden="true">*</span></legend>
             <p class="hint" id="hint-wait">Time from placement until you need to be back in the lab. May exceed 24 hours.</p>
-            <div class="duration-inputs">
-              <label><input id="f-waitHours" name="waitHours" inputmode="numeric" pattern="[0-9]*" value="${input.waitHours}" aria-describedby="hint-wait err-wait"> <span>hours</span></label>
-              <label><input id="f-waitMinutes" name="waitMinutes" inputmode="numeric" pattern="[0-9]*" value="${input.waitMinutes}" placeholder="0" aria-describedby="hint-wait err-wait"> <span>minutes</span></label>
-            </div>
+            ${durationWheels({
+              name: 'wait',
+              label: 'Waiting duration',
+              totalMinutes: toMinutes(input.waitHours, input.waitMinutes),
+              errorKey: 'wait',
+              describedBy: 'hint-wait err-wait',
+            })}
             <div class="chips" role="group" aria-label="Waiting duration presets">
               ${WAIT_PRESETS.map((h) => html`<button type="button" class="chip" data-wait="${h}">${h} h</button>`)}
             </div>
@@ -245,6 +266,7 @@ export function renderForm(container, ctx, { mode, uid, from }) {
   );
 
   const form = root.querySelector('#exp-form');
+  attachWheels(root);
   const touched = new Set();
   let showAll = false;
 
@@ -348,7 +370,8 @@ export function renderForm(container, ctx, { mode, uid, from }) {
           ? html`<span class="muted">Enter incubation at placement</span>`
           : html`${formatDuration(current.minutes)} + ${formatDuration(wait.minutes)} = <strong>${formatDuration(total)}</strong>${total >= 1440 ? ` (${formatDurationDays(total)})` : ''}`}</dd>
       </dl>
-      <p class="hint">Assumes incubation continues uninterrupted from placement. Calculated time only; not a prediction of developmental stage.</p>
+      ${total === null ? '' : stageEstimates(current.minutes, total)}
+      <p class="hint">Assumes incubation continues uninterrupted from placement. Stage estimates use the HH reference ages only — they are not observations. <a href="#/stages">Browse HH stages</a></p>
       ${record && record.originalTargetAt !== targetIso
         ? html`<p class="hint">Original planned target: ${formatDateTime(Date.parse(record.originalTargetAt), record.timeZone)}</p>`
         : ''}`);
@@ -384,7 +407,7 @@ export function renderForm(container, ctx, { mode, uid, from }) {
   form.addEventListener('input', () => update());
   form.addEventListener('change', () => update());
   form.addEventListener('focusout', (e) => {
-    const key = ERROR_KEY[e.target.name];
+    const key = ERROR_KEY[e.target.name] ?? e.target.dataset?.errorKey;
     if (key && !touched.has(key)) {
       touched.add(key);
       update();
@@ -401,8 +424,7 @@ export function renderForm(container, ctx, { mode, uid, from }) {
     }
     const waitBtn = e.target.closest('[data-wait]');
     if (waitBtn) {
-      form.waitHours.value = waitBtn.dataset.wait;
-      form.waitMinutes.value = '';
+      root.querySelector('[data-duration="wait"]')._setTotalMinutes(Number(waitBtn.dataset.wait) * 60);
       touched.add('wait');
       update();
     }

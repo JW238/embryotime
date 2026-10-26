@@ -70,3 +70,22 @@ export function hillsArt() {
     <path class="hill-front" d="M0 120c180-40 360-30 520 0s340 30 480-10 160-20 200-10V160H0z"/>
   </svg>`);
 }
+
+/** Collection badge medallions. kind: crack | peek | chick | pair */
+export function badgeArt(kind) {
+  const egg = (x, y, sc = 1) =>
+    `<path class="egg-shell" transform="translate(${x} ${y}) scale(${sc})" d="M0-26c12 0 21 19 21 33 0 13-9 21-21 21S-21 20-21 7c0-14 9-33 21-33z"/>`;
+  const chick = (x, y, sc = 1) => `<g transform="translate(${x} ${y}) scale(${sc})">
+      <ellipse class="chick-body" cx="0" cy="0" rx="17" ry="16"/>
+      <circle class="ink-fill" cx="-6" cy="-3" r="2.2"/><circle class="ink-fill" cx="6" cy="-3" r="2.2"/>
+      <path class="chick-beak" d="M-3 2l3 4 3-4z"/>
+      <path class="shell-half" d="M-21 8c0 13 9 21 21 21s21-8 21-21l-5 4-5-5-6 5-5-5-6 5-5-5z"/></g>`;
+  const inner = {
+    crack: `${egg(40, 44)}<polyline class="egg-crack badge-crack" points="22,46 30,40 36,47 42,38 49,47 57,41"/>`,
+    peek: `${egg(40, 44)}<path class="badge-gap" d="M22 40l8-6 6 7 6-9 7 9 8-6v4H22z"/><circle class="ink-fill" cx="34" cy="38" r="2.2"/><circle class="ink-fill" cx="46" cy="38" r="2.2"/>`,
+    chick: chick(40, 42),
+    pair: `${chick(28, 46, 0.8)}${chick(53, 40, 0.9)}`,
+  }[kind];
+  return raw(`<svg class="badge-svg badge-${kind}" viewBox="0 0 80 80" aria-hidden="true" focusable="false">
+    <circle class="badge-disc" cx="40" cy="40" r="37"/>${inner}</svg>`);
+}

@@ -121,6 +121,70 @@ time, target time, reminders and status. Eggs are **counted, not tracked one by 
 - CSV export has columns for initial, active, completed, removed and cancelled eggs. The .ics
   description includes the egg count.
 
+## HH stages, observations and the Egg collection
+
+**Reference data.** `src/hh-stages.js` holds Hamburger–Hamilton stages 1–46 with the reference
+ages and short identifying features. They come from Hamburger & Hamilton (1951), as tabulated by
+[UNSW Embryology](https://embryology.med.unsw.edu.au/embryology/index.php/Hamburger_Hamilton_Stages)
+(accessed 26 Oct 2026). Ages are converted to hours. HH1 has no listed age. The **HH stages** page
+(`#/stages`) lets you browse them with a wheel or as a full table.
+
+**Estimates use only the listed ages.** Nothing is interpolated or extrapolated.
+Incubation age = incubation at placement + time since placement (assuming continuous incubation).
+
+| Situation | Estimate |
+|---|---|
+| Age inside one or more listed ranges | All of those stages, e.g. 50 h → HH13–HH15 (ranges overlap) |
+| Age in a gap between listed ages | The two neighbouring stages, e.g. 39 h → HH10–HH11 |
+| Younger than 6 h (first listed age) | HH1–HH2 |
+| Older than 21 d | HH46, labelled "beyond the reference ages" |
+
+Estimates are always labelled **estimate** and are never shown as observations.
+
+**Wheels.** Durations use day/hour/minute wheels that write to the same hidden hour/minute fields
+as before, so validation and stored data are unchanged. Wheels support arrow keys, Page Up/Down,
+Home/End and typing digits, as well as scroll and tap.
+
+**Observations** (Record observation on a batch, or from its egg grid). You'll be asked:
+*Does the observed HH stage match the estimated stage?*
+- **Yes**: if the estimate is a range, choose which stage within it.
+- **No**: choose the observed stage on a wheel. Its reference age and features are shown.
+- **Unable to confirm**: no stage is stored, and the estimate stays an estimate.
+
+Each observation is appended to the batch's `observations` list as
+`{ id, recordedAt, observedAt, ageMinutes, estimate: { stages, label, method, referenceVersion },
+verdict, observedStage, note }`:
+- `estimate` is a **snapshot**, so changes to the reference table never rewrite past records.
+- Observations are never edited in place and are logged in the change history.
+- Recording is never required. After **Mark completed** an optional "Final stage check" appears with
+  a Skip button. Viewing a batch never prompts.
+- Saving the same batch, minute, answer and stage twice is rejected as a duplicate.
+
+**Chart** (batch details). The x-axis is calculated incubation age and the y-axis is HH stage:
+- the shaded band is the reference estimate;
+- a bracket shows the estimate stored with each observation;
+- observations use shapes: ● matches, ◆ different (same colour), and ○ in a separate
+  "not confirmed" lane;
+- observations are never connected by lines, and periods without data stay empty;
+- conflicting observations within an hour are flagged;
+- a table lists every observation with its time and note.
+
+With no observations, the details page shows an explanation instead of a chart.
+
+**Egg collection** (`#/collection`, also linked from the hatchery). There are badges at 1, 5, 20
+and 50 observations. Thresholds and text are in the `BADGES` list in `src/badges.js`.
+
+Counting rules:
+- each observation counts once per batch, never once per egg;
+- matches, different and unable-to-confirm answers all count equally, so guessing a stage is never
+  rewarded;
+- accidental duplicates count once;
+- demo batches don't count.
+
+Unlock dates are stored separately under `embryotime.badges.v1`. Badges never change experiment
+data, are never revoked, and are never shared or ranked. There are no coins, streaks or
+leaderboards.
+
 ## The hatchery (home screen)
 
 - Each researcher has one **personal coop** (`#/`). The coop holds one **nest per open batch**,
@@ -236,6 +300,12 @@ tests/                     node:test suites for the logic modules
   changes counts only. Tracking individual eggs (e.g. per-egg IDs or outcomes) would need a new
   per-egg record.
 - Egg counts are limited to 10–50 per batch in this version.
+- Stage estimates are only as precise as the reference table's listed ages. Individual embryos
+  and incubation conditions vary.
+- Observations describe a batch, not individual eggs, and can't be edited or deleted from the
+  interface; they're kept as a permanent log.
+- The chart and observation table are in the batch details only. History/CSV export doesn't
+  include observations yet.
 - Shared laboratory, multiple coops and multi-user features (2.0 spec §4 onward) are not built
   yet. They need a server and accounts. The data model has a `coopId` field ready for them.
 - Reduced-motion styling was checked by inspecting the CSS rules, not by running with the OS

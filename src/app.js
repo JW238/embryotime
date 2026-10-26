@@ -10,6 +10,9 @@ import { renderForm } from './ui/views/form.js';
 import { renderDetails } from './ui/views/details.js';
 import { renderHistory } from './ui/views/history.js';
 import { renderCalendar } from './ui/views/calendar.js';
+import { renderStages } from './ui/views/stages.js';
+import { renderCollection } from './ui/views/collection.js';
+import { checkBadges } from './ui/actions.js';
 
 const main = document.getElementById('main');
 
@@ -77,10 +80,12 @@ function parseRoute() {
   if (parts[0] === 'exp' && parts[1]) return { name: 'details', uid: parts[1] };
   if (parts[0] === 'history') return { name: 'history' };
   if (parts[0] === 'calendar') return { name: 'calendar' };
+  if (parts[0] === 'stages') return { name: 'stages' };
+  if (parts[0] === 'collection') return { name: 'collection' };
   return { name: 'notfound' };
 }
 
-const NAV_FOR = { hatchery: 'hatchery', dashboard: 'workspace', details: 'hatchery', form: 'new', history: 'history', calendar: 'calendar' };
+const NAV_FOR = { hatchery: 'hatchery', dashboard: 'workspace', details: 'hatchery', form: 'new', history: 'history', calendar: 'calendar', stages: 'stages', collection: 'hatchery' };
 
 function render({ keepScroll = false } = {}) {
   const route = parseRoute();
@@ -117,6 +122,8 @@ function render({ keepScroll = false } = {}) {
       details: () => renderDetails(main, ctx, route),
       history: () => renderHistory(main, ctx),
       calendar: () => renderCalendar(main, ctx),
+      stages: () => renderStages(main),
+      collection: () => renderCollection(main, ctx),
       notfound: () => {
         mount(main, html`<div class="empty"><h1>Page not found</h1><a class="btn btn-primary" href="#/">Go to the hatchery</a></div>`);
         return null;
@@ -234,6 +241,7 @@ async function init() {
   });
   document.getElementById('footer-tz').textContent = ctx.browserTimeZone;
   setUpPreviewNotice();
+  if (!state.loadError) checkBadges(ctx, { announce: false }); // e.g. after restoring a backup elsewhere
   render();
   setInterval(tick, 1000);
 }

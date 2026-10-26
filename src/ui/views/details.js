@@ -20,7 +20,9 @@ import {
   isOpen,
   targetShiftMs,
 } from '../../experiment.js';
-import { formatDateTime } from '../../time.js';
+import { formatDateTime, formatDuration } from '../../time.js';
+import { VERDICT_LABEL, estimateStageAt, observationsByTime } from '../../experiment.js';
+import { findConflicts, mountStageChart } from '../stage-chart.js';
 
 export function renderDetails(container, ctx, { uid }) {
   const r = ctx.find(uid);
@@ -49,6 +51,7 @@ export function renderDetails(container, ctx, { uid }) {
       <div class="action-bar">
         ${open ? calendarButton(r) : ''}
         ${open ? html`<a class="btn btn-secondary" href="#/exp/${r.uid}/edit">Edit schedule</a>` : ''}
+        ${r.status !== 'cancelled' ? html`<button type="button" class="btn btn-secondary" data-action="observe" data-uid="${r.uid}">Record observation</button>` : ''}
         ${open ? html`<button type="button" class="btn btn-primary" data-action="complete" data-uid="${r.uid}">Mark completed</button>` : ''}
         ${!open ? html`<button type="button" class="btn btn-secondary" data-action="reopen" data-uid="${r.uid}">Reopen</button>` : ''}
         <details class="more">
@@ -159,6 +162,8 @@ export function renderDetails(container, ctx, { uid }) {
       </section>
     </div>
 
+    ${developmentSection(r, now, open)}
+
     <section class="card">
       <h2>Change history</h2>
       <ol class="timeline">
@@ -177,5 +182,61 @@ export function renderDetails(container, ctx, { uid }) {
     </section>`
   );
   bindActions(root, ctx);
+  const chart = root.querySelector('.stage-chart');
+  if (chart) mountStageChart(chart, r, { nowMs: ctx.now, open });
   return { tickRerender: true };
+}
+
+const ANSWER_SHORT = { match: 'Matches', different: 'Different', unconfirmed: 'Not confirmed' };
+
+function developmentSection(r, now, open) {
+  const obs = observationsByTime(r);
+  const est = open && now >= Date.parse(r.placementAt) ? estimateStageAt(r, now) : null;
+  const conflicts = findConflicts(r);
+  const staged = obs.filter((o) => o.observedStage !== null).length;
+  return html`<section class="card development" aria-labelledby="dev-title">
+    <div class="dev-head">
+      <h2 id="dev-title">Development: estimated vs observed HH stage</h2>
+      ${r.status !== 'cancelled' ? html`<button type="button" class="btn btn-secondary btn-sm" data-action="observe" data-uid="${r.uid}">Record observation</button>` : ''}
+    </div>
+    ${est
+      ? html`<p>Estimated stage now: <strong>${est.label}</strong> <span class="est-tag">estimate</span>
+          <span class="muted">at ${formatDuration(est.ageMinutes)} calculated incubation, from <a href="#/stages">HH reference ages</a> only.</span></p>`
+      : ''}
+    ${obs.length === 0
+      ? html`<div class="empty-inline dev-empty">
+          <p><strong>No stage observations yet.</strong> When you examine embryos from this batch, record the stage you see.
+          The chart compares your observations with the reference estimate once there is at least one.</p>
+        </div>`
+      : html`<div class="stage-chart">
+          <ul class="sc-legend" aria-label="Chart legend">
+            <li><span class="lg lg-band"></span>Reference estimate (current table)</li>
+            <li><span class="lg lg-snap"></span>Estimate stored with each observation</li>
+            <li><span class="lg lg-match"></span>Observed — matches</li>
+            <li><span class="lg lg-diff"></span>Observed — different</li>
+            <li><span class="lg lg-unconf"></span>Not confirmed (no stage)</li>
+          </ul>
+          <div class="sc-canvas"></div>
+          <div class="sc-tooltip" role="tooltip" hidden></div>
+        </div>
+        <p class="hint">Markers are individual observations; they are not joined because no progression between them was observed.
+          ${staged < 2 ? 'More observations will make comparisons more informative.' : ''}</p>
+        ${conflicts.length
+          ? html`<p class="alert alert-info">${conflicts.length === 1 ? 'Two observations' : `${conflicts.length} pairs of observations`} within an hour of each other record different stages
+              (${conflicts.map(([a, b]) => `HH${a.observedStage} vs HH${b.observedStage}`).join('; ')}). Both are shown as recorded.</p>`
+          : ''}
+        <div class="table-wrap"><table class="table obs-table">
+          <thead><tr><th scope="col">Observed at</th><th scope="col">Incubation</th><th scope="col">Estimate then</th><th scope="col">Answer</th><th scope="col">Observed stage</th><th scope="col">Note</th></tr></thead>
+          <tbody>${obs.map(
+            (o) => html`<tr>
+              <td data-label="Observed at">${formatDateTime(Date.parse(o.observedAt), r.timeZone)}</td>
+              <td data-label="Incubation">${formatDuration(o.ageMinutes)}</td>
+              <td data-label="Estimate then"><span title="Reference version ${o.estimate.referenceVersion}">${o.estimate.label}</span></td>
+              <td data-label="Answer" title="${VERDICT_LABEL[o.verdict]}">${ANSWER_SHORT[o.verdict]}</td>
+              <td data-label="Observed stage">${o.observedStage === null ? '—' : html`<strong>HH${o.observedStage}</strong>`}</td>
+              <td data-label="Note" class="pre">${o.note || '—'}</td>
+            </tr>`
+          )}</tbody>
+        </table></div>`}
+  </section>`;
 }

@@ -1,7 +1,7 @@
 // Short, non-blocking visual responses. Never intercepts clicks, never delays work,
 // and with reduced motion it shows a static badge instead of movement.
 
-import { chickArt, eggArt } from './art.js';
+import { badgeArt, chickArt, eggArt } from './art.js';
 
 const PIECES = 14;
 
@@ -27,6 +27,15 @@ export function celebrateHatch(label = '') {
 /** A tiny egg drops in — used after saving a new batch. */
 export function celebrateSaved(label = '') {
   overlay('fx-saved', `<div class="fx-stage"><div class="fx-egg">${eggArt({ stage: 'warming' })}</div>${label ? `<div class="fx-label">${escapeText(label)}</div>` : ''}</div>`, 1300);
+}
+
+/** Badge unlocked: a small medallion pops in. Static with reduced motion. */
+export function celebrateBadge(badge) {
+  overlay(
+    'fx-badge',
+    `<div class="fx-stage"><div class="fx-medal">${badgeArt(badge.art)}</div><div class="fx-label">Badge unlocked: ${escapeText(badge.title)}</div></div>`,
+    1800
+  );
 }
 
 function escapeText(s) {

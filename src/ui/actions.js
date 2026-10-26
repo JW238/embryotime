@@ -2,19 +2,26 @@
 
 import { html, downloadFile, toast } from './dom.js';
 import {
+  VERDICTS,
+  addObservation,
   adjustEggCount,
+  estimateStageAt,
   cancelExperiment,
   completeExperiment,
   eggCounts,
+  validateObservation,
   markCalendarExported,
   reopenExperiment,
 } from '../experiment.js';
 import { buildIcs, icsFileName } from '../ics.js';
 import { buildDemoExperiments } from '../demo.js';
-import { celebrateHatch } from './celebrate.js';
-import { formatDateTime, instantToWallInputs, zonedWallTimeToInstant } from '../time.js';
+import { celebrateBadge, celebrateHatch } from './celebrate.js';
+import { attachWheels, getWheelValue, stageReference, stageWheel } from './wheel.js';
+import { ESTIMATE_METHOD_TEXT, HH_MAX, HH_MIN } from '../hh-stages.js';
+import { countObservations, createBadgeStore, syncUnlocks } from '../badges.js';
+import { formatDateTime, formatDuration, instantToWallInputs, zonedWallTimeToInstant } from '../time.js';
 
-const ACTIONS = new Set(['ics', 'complete', 'cancel', 'reopen', 'duplicate', 'delete', 'eggs-remove', 'eggs-complete']);
+const ACTIONS = new Set(['ics', 'complete', 'cancel', 'reopen', 'duplicate', 'delete', 'eggs-remove', 'eggs-complete', 'observe']);
 
 export function bindActions(root, ctx) {
   root.addEventListener('click', (e) => {
@@ -47,6 +54,9 @@ export async function handleAction(action, uid, ctx) {
         break;
       case 'cancel':
         openCancelDialog(record, ctx);
+        break;
+      case 'observe':
+        openObservationDialog(record, ctx);
         break;
       case 'eggs-remove':
         openEggCountDialog(record, 'removed', ctx);
@@ -81,14 +91,20 @@ export function openDialog(content, onSubmit) {
   const form = dialog.querySelector('form');
   const errorEl = dialog.querySelector('.dialog-error');
   dialog.querySelector('[data-close]').addEventListener('click', () => dialog.close());
+  let busy = false;
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
+    if (busy) return; // ignore double submits while saving
+    busy = true;
+    form.querySelectorAll('[type=submit]').forEach((b) => (b.disabled = true));
     let error;
     try {
       error = await onSubmit(new FormData(form), form);
     } catch (err) {
       error = err.message || 'Something went wrong.';
     }
+    busy = false;
+    form.querySelectorAll('[type=submit]').forEach((b) => (b.disabled = false));
     if (error) {
       errorEl.textContent = error;
       errorEl.hidden = false;
@@ -137,6 +153,10 @@ function openCompleteDialog(record, ctx) {
       toast(`${record.experimentId} marked as completed.`);
       celebrateHatch(`${record.experimentId} completed`);
       ctx.rerender();
+      setTimeout(() => {
+        const done = ctx.find(record.uid);
+        if (done) openObservationDialog(done, ctx, { afterCompletion: true });
+      }, 400);
       return null;
     }
   );
@@ -233,4 +253,146 @@ function openEggCountDialog(record, kind, ctx) {
   };
   input.addEventListener('input', show);
   show();
+}
+
+/** Unlock any earned badges (stored separately from experiment data). */
+export function checkBadges(ctx, { announce = true } = {}) {
+  const store = createBadgeStore();
+  const { state, newly } = syncUnlocks(store.load(), countObservations(ctx.experiments), ctx.now());
+  if (!newly.length) return [];
+  store.save(state);
+  if (announce) newly.forEach((b, i) => setTimeout(() => celebrateBadge(b), 600 + i * 1900));
+  return newly;
+}
+
+const VERDICT_CHOICES = [
+  [VERDICTS.MATCH, 'Yes, it matches.'],
+  [VERDICTS.DIFFERENT, 'No, the observed stage is different.'],
+  [VERDICTS.UNCONFIRMED, 'Unable to confirm the actual stage yet.'],
+];
+
+/** Record an HH stage observation; the predicted stage is snapshotted alongside it. */
+export function openObservationDialog(record, ctx, { afterCompletion = false } = {}) {
+  const tz = record.timeZone;
+  const now = instantToWallInputs(ctx.now(), tz);
+  const dialog = openDialog(
+    html`<form class="dialog-form obs-form" novalidate>
+      <h2>${afterCompletion ? 'Final stage check (optional)' : 'Record a stage observation'}</h2>
+      <p class="muted">${record.experimentId} · ${record.name}. One observation describes the batch as a whole.</p>
+      <fieldset>
+        <legend>Observation time <span class="muted">(${tz})</span></legend>
+        <div class="row">
+          <label class="field">Date <input type="date" name="date" value="${now.date}" required></label>
+          <label class="field">Time <input type="time" name="time" value="${now.time}" required></label>
+          <button type="button" class="btn btn-ghost btn-sm" data-now>Now</button>
+        </div>
+      </fieldset>
+      <div class="obs-estimate" data-estimate aria-live="polite"></div>
+      <fieldset class="obs-question">
+        <legend>Does the observed HH stage match the estimated stage?</legend>
+        ${VERDICT_CHOICES.map(([v, label]) => html`<label class="check"><input type="radio" name="verdict" value="${v}" required> ${label}</label>`)}
+      </fieldset>
+      <div class="obs-stage" data-stage-pick hidden></div>
+      <label class="field">Observation note <span class="muted">(optional)</span><textarea name="note" rows="2" maxlength="2000"></textarea></label>
+      <p class="hint">Observed stages are saved separately from the estimate. A difference is useful data, not an error.</p>
+      <p class="dialog-error field-error" role="alert" hidden></p>
+      <div class="dialog-actions">
+        <button type="button" class="btn btn-ghost" data-close>${afterCompletion ? 'Skip' : 'Cancel'}</button>
+        <button type="submit" class="btn btn-primary">Save observation</button>
+      </div>
+    </form>`,
+    async (data) => {
+      const at = zonedWallTimeToInstant(data.get('date'), data.get('time'), tz);
+      if (!at.ok) return at.error;
+      const verdict = data.get('verdict');
+      if (!verdict) return 'Choose one of the three answers.';
+      const input = { observedAtMs: at.instantMs, verdict, observedStage: pickedStage(verdict, at.instantMs), note: data.get('note') };
+      const v = validateObservation(ctx.find(record.uid) ?? record, input, { nowMs: ctx.now() });
+      if (!v.ok) return Object.values(v.errors)[0];
+      const updated = addObservation(ctx.find(record.uid) ?? record, input, { nowMs: ctx.now() });
+      await ctx.save(updated);
+      toast('Observation saved.');
+      checkBadges(ctx);
+      ctx.rerender();
+      return null;
+    }
+  );
+
+  const form = dialog.querySelector('form');
+  const estimateEl = dialog.querySelector('[data-estimate]');
+  const pick = dialog.querySelector('[data-stage-pick]');
+  let estimate = null;
+
+  function observedAt() {
+    const r = zonedWallTimeToInstant(form.date.value, form.time.value, tz);
+    return r.ok ? r.instantMs : NaN;
+  }
+
+  function pickedStage(verdict, atMs) {
+    if (verdict === VERDICTS.UNCONFIRMED) return null;
+    const est = estimateStageAt(record, atMs);
+    if (verdict === VERDICTS.MATCH && est.stages[0] === est.stages[1]) return est.stages[0];
+    const w = pick.querySelector('[data-wheel]');
+    return w ? getWheelValue(w) : null;
+  }
+
+  function renderEstimate() {
+    const at = observedAt();
+    if (!Number.isFinite(at) || at < Date.parse(record.placementAt)) {
+      estimate = null;
+      estimateEl.innerHTML = String(html`<p class="muted">Enter an observation time after placement to see the estimate.</p>`);
+      return;
+    }
+    estimate = estimateStageAt(record, at);
+    estimateEl.innerHTML = String(html`<div class="label">Estimated stage <span class="est-tag">estimate</span></div>
+      <p><strong>${estimate.label}</strong> at ${formatDuration(estimate.ageMinutes)} calculated incubation.
+      <span class="hint block">${ESTIMATE_METHOD_TEXT[estimate.method]} Uses the HH reference ages only.</span></p>`);
+  }
+
+  function renderPick() {
+    const verdict = form.verdict.value;
+    const prev = pick.querySelector('[data-wheel]');
+    const prevValue = prev ? getWheelValue(prev) : null;
+    if (!verdict || verdict === VERDICTS.UNCONFIRMED || !estimate) {
+      pick.hidden = true;
+      pick.innerHTML = '';
+      return;
+    }
+    const [lo, hi] = estimate.stages;
+    let content;
+    if (verdict === VERDICTS.MATCH && lo === hi) {
+      content = html`<div class="label">Observed stage</div>${stageReference(lo)}`;
+    } else if (verdict === VERDICTS.MATCH) {
+      const value = prevValue >= lo && prevValue <= hi ? prevValue : lo;
+      content = html`<div class="obs-pick"><div><div class="label" id="pick-label">Which stage within ${estimate.label}?</div>
+        ${stageWheel({ id: 'obs-stage', from: lo, to: hi, value, describedBy: 'pick-label' })}</div>
+        <div data-ref>${stageReference(value)}</div></div>`;
+    } else {
+      const outside = hi < HH_MAX ? hi + 1 : lo - 1;
+      const value = prevValue !== null && (prevValue < lo || prevValue > hi) ? prevValue : outside;
+      content = html`<div class="obs-pick"><div><div class="label" id="pick-label">Observed HH stage</div>
+        ${stageWheel({ id: 'obs-stage', from: HH_MIN, to: HH_MAX, value, describedBy: 'pick-label' })}</div>
+        <div data-ref>${stageReference(value)}</div></div>`;
+    }
+    pick.innerHTML = String(content);
+    pick.hidden = false;
+    attachWheels(pick);
+    const w = pick.querySelector('[data-wheel]');
+    w?.addEventListener('wheelchange', () => {
+      pick.querySelector('[data-ref]').innerHTML = String(stageReference(getWheelValue(w)));
+    });
+  }
+
+  form.addEventListener('change', (e) => {
+    if (e.target.name === 'date' || e.target.name === 'time') renderEstimate();
+    if (['date', 'time', 'verdict'].includes(e.target.name)) renderPick();
+  });
+  dialog.querySelector('[data-now]').addEventListener('click', () => {
+    const n = instantToWallInputs(ctx.now(), tz);
+    form.date.value = n.date;
+    form.time.value = n.time;
+    renderEstimate();
+    renderPick();
+  });
+  renderEstimate();
 }

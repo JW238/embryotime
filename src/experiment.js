@@ -15,6 +15,7 @@ import {
   zonedDateKey,
   zonedWallTimeToInstant,
 } from './time.js';
+import { estimateStage, isValidStage, stageInRange, stageRangeLabel } from './hh-stages.js';
 
 export const SCHEMA_VERSION = 1;
 
@@ -204,6 +205,7 @@ export function createExperiment(value, { nowMs, uid = newUid(), demo = false })
     coopId: DEFAULT_COOP_ID,
     ...value,
     eggAdjustments: [],
+    observations: [],
     originalTargetAt: value.targetAt,
     status: ms(value.placementAt) > nowMs ? STATUS.PLANNED : STATUS.ACTIVE,
     completedAt: null,
@@ -360,6 +362,7 @@ export function normalizeRecord(r) {
     ...r,
     initialEggCount: Number.isInteger(r.initialEggCount) ? r.initialEggCount : null,
     eggAdjustments: Array.isArray(r.eggAdjustments) ? r.eggAdjustments : [],
+    observations: Array.isArray(r.observations) ? r.observations : [],
   };
 }
 
@@ -465,6 +468,114 @@ export function batchTotals(records, nowMs) {
 export function formatEggs(n) {
   return `${n} egg${n === 1 ? '' : 's'}`;
 }
+
+// ---------- HH stage observations ----------
+//
+// Observations are append-only and belong to the whole batch (eggs share one schedule).
+// Each one stores a frozen snapshot of the stage estimate at observation time, so a later
+// change to the reference table never rewrites past records. The observed stage is kept
+// separately from the estimate and is null when the stage could not be confirmed.
+
+export const VERDICTS = Object.freeze({ MATCH: 'match', DIFFERENT: 'different', UNCONFIRMED: 'unconfirmed' });
+export const VERDICT_LABEL = {
+  match: 'Matches the estimate',
+  different: 'Observed stage differs from the estimate',
+  unconfirmed: 'Stage not confirmed',
+};
+
+/** Calculated incubation age (minutes) at an instant: age at placement + time since placement. */
+export function incubationAgeAt(record, atMs) {
+  return record.currentIncubationMinutes + Math.max(0, Math.floor((atMs - ms(record.placementAt)) / 60_000));
+}
+
+/** Estimated stage snapshot for this batch at an instant (reference table only). */
+export function estimateStageAt(record, atMs) {
+  return estimateStage(incubationAgeAt(record, atMs));
+}
+
+const minuteKey = (iso) => Math.floor(Date.parse(iso) / 60_000);
+
+/** Two observations are accidental duplicates if they agree on minute, verdict and stage. */
+export function observationKey(o) {
+  return `${minuteKey(o.observedAt)}|${o.verdict}|${o.observedStage ?? '-'}`;
+}
+
+/**
+ * Validate an observation for a batch.
+ * input: { observedAtMs, verdict, observedStage (number|null), note }
+ * Returns { ok, errors, estimate } — estimate is the snapshot that would be stored.
+ */
+export function validateObservation(record, input, { nowMs }) {
+  const errors = {};
+  const at = input.observedAtMs;
+  let estimate = null;
+  if (!Number.isFinite(at)) errors.observedAt = 'Enter a valid observation date and time.';
+  else if (at > nowMs + 60_000) errors.observedAt = 'Observation time cannot be in the future.';
+  else if (at < ms(record.placementAt)) errors.observedAt = 'Observation time is before this batch was placed.';
+  else estimate = estimateStageAt(record, at);
+
+  const verdict = input.verdict;
+  if (!Object.values(VERDICTS).includes(verdict)) errors.verdict = 'Choose one of the three answers.';
+  const stage = input.observedStage ?? null;
+  if (estimate && verdict === VERDICTS.MATCH) {
+    if (stage === null) errors.observedStage = `Choose which stage within ${estimate.label} you observed.`;
+    else if (!stageInRange(stage, estimate.stages)) errors.observedStage = `HH${stage} is outside the estimate (${estimate.label}). Choose “No, the observed stage is different”.`;
+  }
+  if (estimate && verdict === VERDICTS.DIFFERENT) {
+    if (!isValidStage(stage)) errors.observedStage = 'Choose the observed HH stage (1–46).';
+    else if (stageInRange(stage, estimate.stages)) errors.observedStage = `HH${stage} is within the estimate (${estimate.label}). Choose “Yes, it matches”.`;
+  }
+  if (verdict === VERDICTS.UNCONFIRMED && stage !== null) errors.observedStage = 'No stage is recorded when the stage could not be confirmed.';
+  if (String(input.note ?? '').length > 2000) errors.note = 'Note must be 2000 characters or fewer.';
+  return { ok: Object.keys(errors).length === 0, errors, estimate };
+}
+
+export class DuplicateObservationError extends Error {}
+
+/** Append a validated observation (and a history line). Never modifies earlier observations. */
+export function addObservation(record, input, { nowMs, id = newUid() }) {
+  const v = validateObservation(record, input, { nowMs });
+  if (!v.ok) throw new RangeError(Object.values(v.errors)[0]);
+  const observation = {
+    id,
+    recordedAt: iso(nowMs),
+    observedAt: iso(input.observedAtMs),
+    ageMinutes: v.estimate.ageMinutes,
+    estimate: v.estimate,
+    verdict: input.verdict,
+    observedStage: input.verdict === VERDICTS.UNCONFIRMED ? null : input.observedStage,
+    note: String(input.note ?? '').trim(),
+  };
+  const existing = record.observations ?? [];
+  if (existing.some((o) => observationKey(o) === observationKey(observation))) {
+    throw new DuplicateObservationError('This observation was already recorded for this batch.');
+  }
+  const outcome =
+    observation.verdict === VERDICTS.UNCONFIRMED
+      ? 'stage not confirmed'
+      : `observed HH${observation.observedStage}${observation.verdict === VERDICTS.MATCH ? ' (matches estimate)' : ' (differs from estimate)'}`;
+  return {
+    ...record,
+    observations: [...existing, observation],
+    updatedAt: iso(nowMs),
+    history: [
+      ...record.history,
+      {
+        at: iso(nowMs),
+        action: 'observation',
+        summary: `Stage observation at ${formatDuration(observation.ageMinutes)} incubation: estimate ${observation.estimate.label}, ${outcome}`,
+        reason: observation.note,
+      },
+    ],
+  };
+}
+
+/** Observations sorted by observation time (records keep insertion order). */
+export function observationsByTime(record) {
+  return [...(record.observations ?? [])].sort((a, b) => Date.parse(a.observedAt) - Date.parse(b.observedAt));
+}
+
+export { stageRangeLabel };
 
 // ---------- derived state ----------
 

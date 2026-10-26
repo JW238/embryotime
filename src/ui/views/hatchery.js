@@ -7,6 +7,8 @@ import { bindActions, loadDemoData, openDialog, removeDemoData } from '../action
 import { DEFAULT_COOP_ID, batchTotals, eggCounts, formatEggs } from '../../experiment.js';
 import { STAGE_LABEL, coopEggs, eggProgress, eggStage, greeting, henMessage, recentlyHatched, shellVariant } from '../../hatchery.js';
 import { coopDisplayName } from '../../storage.js';
+import { badgeArt } from '../art.js';
+import { BADGES, badgeProgress, countObservations } from '../../badges.js';
 import { formatDate, formatDateTime, formatTime, zoneAbbreviation } from '../../time.js';
 
 // Text glyph per stage, so stages differ by shape and words, not only colour.
@@ -89,6 +91,7 @@ function clutchPanel(r, now) {
           <p class="hint">All eggs share this batch's schedule: target ${formatDateTime(t, r.timeZone)}${stage === 'due' ? ' — now overdue' : ''}.
             Eggs are counted, not tracked one by one, so positions in the grid are illustrative.</p>
           <div class="clutch-actions">
+            <button type="button" class="btn btn-primary btn-sm" data-action="observe" data-uid="${r.uid}">Record observation…</button>
             <button type="button" class="btn btn-secondary btn-sm" data-action="eggs-remove" data-uid="${r.uid}" ${c.active ? '' : 'disabled'}>Remove eggs…</button>
             <button type="button" class="btn btn-secondary btn-sm" data-action="eggs-complete" data-uid="${r.uid}" ${c.active ? '' : 'disabled'}>Complete some eggs early…</button>
             <a class="btn btn-ghost btn-sm" href="#/exp/${r.uid}">Open full record →</a>
@@ -183,6 +186,8 @@ export function renderHatchery(container, ctx, { laid } = {}) {
           </section>`
         : ''}
 
+      ${collectionTeaser(all)}
+
       ${hasDemo
         ? html`<p class="demo-note">Demo eggs are examples, not real experiments. <button type="button" class="link" data-remove-demo>Remove demo data</button></p>`
         : ''}
@@ -239,4 +244,18 @@ function openRenameDialog(ctx) {
       return null;
     }
   );
+}
+
+function collectionTeaser(records) {
+  const p = badgeProgress(countObservations(records));
+  const pct = Math.round(p.fraction * 100);
+  const shown = p.next ?? BADGES.at(-1);
+  return html`<a class="card collection-teaser" href="#/collection">
+    <span class="teaser-medal ${p.next ? 'is-locked' : 'is-unlocked'}">${badgeArt(shown.art)}</span>
+    <span class="teaser-body">
+      <strong>Egg collection</strong> <span class="muted small">${p.earned.length}/${BADGES.length} badges</span>
+      <span class="progress" role="progressbar" aria-label="Progress toward the next badge" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${pct}"><span style="width:${pct}%"></span></span>
+      <span class="small muted">${p.next ? `${p.remaining} more stage observation${p.remaining === 1 ? '' : 's'} to “${p.next.title}”` : 'All badges collected'}</span>
+    </span>
+  </a>`;
 }
