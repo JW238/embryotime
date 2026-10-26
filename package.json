@@ -1,0 +1,14 @@
+{
+  "name": "embryotime",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Chicken embryo incubation scheduler for lab researchers",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test tests/*.test.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

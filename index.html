@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <!-- The app loads only its own files and makes no network requests. -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <meta name="referrer" content="no-referrer">
+  <title>EmbryoTime</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cellipse cx='16' cy='17' rx='10' ry='13' fill='%23ffd66b' stroke='%235a4232' stroke-width='2'/%3E%3Cpath d='M16 10v7l4 3' stroke='%235a4232' stroke-width='2.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="site-header">
+    <div class="wrap header-inner">
+      <a class="brand" href="#/">
+        <svg class="brand-mark" viewBox="0 0 32 36" aria-hidden="true"><path d="M16 3c7 0 12 11 12 19 0 7-5 11-12 11S4 29 4 22C4 14 9 3 16 3z"/><path class="brand-hand" d="M16 14v7l4 3"/></svg>
+        <span>EmbryoTime</span>
+      </a>
+      <nav aria-label="Main">
+        <a href="#/" data-nav="hatchery">Hatchery</a>
+        <a href="#/workspace" data-nav="workspace">Workspace</a>
+        <a href="#/calendar" data-nav="calendar">Calendar</a>
+        <a href="#/history" data-nav="history">History</a>
+        <a href="#/new" data-nav="new" class="nav-cta">+ Add batch</a>
+      </nav>
+    </div>
+  </header>
+
+  <div class="preview-banner" id="preview-banner" role="note" hidden>
+    <div class="wrap preview-inner">
+      <p><strong>Preview version.</strong> Experiments you enter are saved only in this browser on this device. Nothing is uploaded, there are no accounts,
+        and colleagues cannot see your data (or you theirs). Clearing browser data deletes it — use History › Download backup to keep a copy.</p>
+      <button type="button" class="btn btn-secondary btn-sm" id="preview-dismiss">Got it</button>
+    </div>
+  </div>
+
+  <main id="main" class="wrap" tabindex="-1">
+    <p class="loading">Loading…</p>
+  </main>
+
+  <footer class="site-footer">
+    <div class="wrap">
+      <p><strong>Local data only.</strong> Records are saved in this browser on this device — not shared across devices or with other researchers. Download a backup from History.</p>
+      <p>Your computer's time zone: <span id="footer-tz">—</span>. Each experiment shows times in its recorded time zone. EmbryoTime calculates schedules only; it does not predict developmental outcomes.</p>
+    </div>
+  </footer>
+
+  <div id="toasts" class="toasts"></div>
+  <dialog id="dialog" aria-label="Experiment action"></dialog>
+
+  <noscript><p class="wrap">EmbryoTime needs JavaScript enabled.</p></noscript>
+  <script type="module" src="src/app.js"></script>
+</body>
+</html>

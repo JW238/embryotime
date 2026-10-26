@@ -1,0 +1,7 @@
+# Local tooling and OS files — never published
+.claude/
+.DS_Store
+node_modules/
+*.log
+.env
+.env.*
