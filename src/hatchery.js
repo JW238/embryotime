@@ -104,6 +104,6 @@ export function henMessage(records, nowMs, { justLaidUid = null } = {}) {
   }
   const today = zonedDateKey(t, next.timeZone) === zonedDateKey(nowMs, next.timeZone);
   const when = today ? `today at ${formatTime(t, next.timeZone)}` : formatDateTime(t, next.timeZone);
-  const count = eggs.length === 1 ? 'Your egg is' : `All ${eggs.length} eggs are`;
+  const count = eggs.length === 1 ? 'Your batch is' : `All ${eggs.length} batches are`;
   return { mood: 'idle', text: `${count} cozy. Next check: ${next.experimentId}, ${when} (in ${inText}).` };
 }
