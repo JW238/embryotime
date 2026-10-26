@@ -60,6 +60,11 @@ git push
 GitHub Pages republishes automatically within a minute or two of each push. You can follow
 progress with `gh run list` or under the repository's **Actions** tab.
 
+GitHub Pages tells browsers they may reuse files for up to **10 minutes** (`max-age=600`), and
+this can't be configured. After an update, visitors may see the previous version for a few
+minutes. A hard refresh (Cmd+Shift+R on Mac, Ctrl+Shift+R on Windows) loads the new one
+immediately. Visitors' saved experiments are not affected by updates.
+
 ### Taking it down
 
 Disable Pages under **Settings → Pages** in the repository, or make the repository private.
