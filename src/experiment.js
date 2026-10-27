@@ -15,7 +15,18 @@ import {
   zonedDateKey,
   zonedWallTimeToInstant,
 } from './time.js';
-import { estimateStage, isValidStage, stageInRange, stageRangeLabel } from './hh-stages.js';
+import {
+  BASIS_LABEL,
+  PLANNED_RETURN,
+  estimateStageForRange,
+  formatHoursRange,
+  getStage,
+  isValidStage,
+  planStages,
+  stageInRange,
+  stageRangeLabel,
+  windowPlan,
+} from './hh-stages.js';
 
 export const SCHEMA_VERSION = 1;
 
@@ -44,7 +55,8 @@ export const STATUS_LABEL = {
 
 /** Reminder offsets offered as checkboxes, in minutes before the target. */
 export const REMINDER_PRESETS = [15, 30, 60, 120, 1440];
-export const DEFAULT_REMINDERS = [30, 120];
+// Calendar alerts are opt-in: nothing is pre-selected.
+export const DEFAULT_REMINDERS = [];
 export const MAX_REMINDER_MINUTES = 7 * 1440;
 
 export function formatReminder(minutes) {
@@ -72,6 +84,58 @@ export function newUid() {
     : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
+/** Default batch name from the local date and time, e.g. "October 26, 2026 — 8:15 PM". */
+export function defaultBatchName(nowMs, timeZone) {
+  const date = new Intl.DateTimeFormat('en-US', { timeZone, month: 'long', day: 'numeric', year: 'numeric' }).format(nowMs);
+  const time = new Intl.DateTimeFormat('en-US', { timeZone, hour: 'numeric', minute: '2-digit', hour12: true }).format(nowMs);
+  return `${date} — ${time}`;
+}
+
+/** Visible title of a batch: its name, or the record ID for older records without one. */
+export function displayName(record) {
+  return String(record?.name ?? '').trim() || record?.experimentId || 'Unnamed batch';
+}
+
+// ---------- temperature ----------
+// Recorded for context only. EmbryoTime never adjusts stage estimates for temperature:
+// there is no validated correction model in this app. The UNSW reference page does not state
+// the incubation conditions behind its ages, so no numeric "outside reference" threshold is
+// applied unless one is configured here from a reliable source.
+export const REFERENCE_TEMPERATURE_C = null; // e.g. { min: …, max: …, source: '…' } — leave null unless sourced
+const TEMP_SANITY_C = [0, 60]; // rejects obvious typos only
+
+export function toCelsius({ value, unit }) {
+  return unit === 'F' ? ((value - 32) * 5) / 9 : value;
+}
+
+/** Parse optional temperature input. Returns { ok, temperature: {value, unit}|null } or { ok:false, error }. */
+export function parseTemperature(valueStr, unit) {
+  const raw = String(valueStr ?? '').trim();
+  if (!raw) return { ok: true, temperature: null };
+  if (unit !== 'C' && unit !== 'F') return { ok: false, error: 'Choose °C or °F.' };
+  if (!/^-?\d+(\.\d+)?$/.test(raw)) return { ok: false, error: 'Temperature must be a number, e.g. 37.5.' };
+  const value = Number(raw);
+  const c = toCelsius({ value, unit });
+  if (c < TEMP_SANITY_C[0] || c > TEMP_SANITY_C[1]) {
+    return { ok: false, error: `That temperature (${raw} °${unit}) looks like a typo. Enter the incubator setting.` };
+  }
+  return { ok: true, temperature: { value, unit } };
+}
+
+export function formatTemperature(t) {
+  return t ? `${t.value} °${t.unit}` : '—';
+}
+
+/** Note shown wherever a temperature is displayed. Never alters an estimate. */
+export function temperatureNotice(t) {
+  if (!t) return null;
+  const ref = REFERENCE_TEMPERATURE_C;
+  if (ref && (toCelsius(t) < ref.min || toCelsius(t) > ref.max)) {
+    return `Recorded temperature is outside the configured reference conditions (${ref.min}–${ref.max} °C, ${ref.source}). Stage estimates are not adjusted.`;
+  }
+  return 'Stage estimates are not adjusted for temperature; the reference ages assume the conditions of the original study.';
+}
+
 // ---------- validation ----------
 
 export function parseEggCount(value) {
@@ -90,6 +154,9 @@ export function parseEggCount(value) {
  * input: { experimentId, name, batchId, currentHours, currentMinutes, placementDate, placementTime,
  *          timeZone, placementOccurrence ('first'|'second'), waitHours, waitMinutes,
  *          reminderOffsets: number[], notes, conditions }
+ * Timing: by default from entered durations (currentHours/Minutes, waitHours/Minutes). With
+ *   input.timingMode === 'stage', from { currentStage, targetStage, schedulePoint, stageObserved }:
+ *   the durations are derived from the HH reference ranges and value.stagePlan records how.
  * options: { existingIds: string[] (other experiments), nowMs,
  *            minEggCount: eggs already removed/completed from this batch (editing only) }
  * Returns { ok, errors: {field: message}, warnings: string[], value, ambiguousPlacement }
@@ -106,7 +173,7 @@ export function validateExperimentInput(input, { existingIds = [], nowMs, minEgg
   } else if (existingIds.includes(experimentId)) errors.experimentId = `ID "${experimentId}" is already used by another experiment.`;
 
   const name = str(input.name);
-  if (!name) errors.name = 'Experiment name is required.';
+  if (!name) errors.name = 'Batch name is required.';
   else if (name.length > 120) errors.name = 'Name must be 120 characters or fewer.';
 
   const batchId = str(input.batchId);
@@ -118,14 +185,43 @@ export function validateExperimentInput(input, { existingIds = [], nowMs, minEgg
     errors.eggCount = `${minEggCount} eggs have already been removed or completed in this batch; the batch cannot have fewer.`;
   }
 
-  const current = parseDuration(input.currentHours, input.currentMinutes, {
-    allowZero: true,
-    label: 'Incubation at placement',
-  });
-  if (!current.ok) errors.currentIncubation = current.error;
+  let current;
+  let wait;
+  let stagePlan = null;
+  if (input.timingMode === 'stage') {
+    const num = (v) => (v === '' || v === null || v === undefined ? null : Number(v));
+    const p = planStages({
+      start: input.start,
+      currentStage: num(input.currentStage),
+      targetStage: num(input.targetStage),
+      plannedReturn: input.plannedReturn,
+      observed: Boolean(input.stageObserved),
+    });
+    current = { ok: true, minutes: 0 };
+    wait = { ok: true, minutes: 0 };
+    if (!p.ok) {
+      errors[p.field === 'plannedReturn' ? 'plannedReturn' : 'stages'] = p.error;
+      // Report every missing step at once, not only the first.
+      if (p.field !== 'plannedReturn' && !Object.hasOwn(PLANNED_RETURN, input.plannedReturn ?? '')) {
+        errors.plannedReturn = 'Choose whether to plan a specific return time.';
+      }
+    } else {
+      stagePlan = p.plan;
+      // Lower bound of the baseline range; the full range lives in stagePlan.baselineAgeHours.
+      current = { ok: true, minutes: Math.round(p.plan.baselineAgeHours[0] * 60) };
+      // targetAt = planned return if chosen, otherwise the window start (used for ordering only).
+      wait = { ok: true, minutes: p.plan.plannedReturnMinutes ?? Math.round(p.plan.windowHours[0] * 60) };
+    }
+  } else {
+    current = parseDuration(input.currentHours, input.currentMinutes, {
+      allowZero: true,
+      label: 'Incubation at placement',
+    });
+    if (!current.ok) errors.currentIncubation = current.error;
 
-  const wait = parseDuration(input.waitHours, input.waitMinutes, { label: 'Waiting duration' });
-  if (!wait.ok) errors.wait = wait.error;
+    wait = parseDuration(input.waitHours, input.waitMinutes, { label: 'Waiting duration' });
+    if (!wait.ok) errors.wait = wait.error;
+  }
 
   const timeZone = str(input.timeZone);
   if (!isValidTimeZone(timeZone)) errors.timeZone = 'Choose a valid time zone.';
@@ -154,18 +250,25 @@ export function validateExperimentInput(input, { existingIds = [], nowMs, minEgg
     errors.reminders = `Reminder offsets must be whole minutes between 1 and ${MAX_REMINDER_MINUTES} (7 days).`;
   }
 
+  const temp = parseTemperature(input.temperatureValue, input.temperatureUnit ?? 'C');
+  if (!temp.ok) errors.temperature = temp.error;
+
   const notes = String(input.notes ?? '').trim();
   const conditions = String(input.conditions ?? '').trim();
   if (notes.length > 5000) errors.notes = 'Notes must be 5000 characters or fewer.';
   if (conditions.length > 2000) errors.conditions = 'Conditions must be 2000 characters or fewer.';
 
+  if (stagePlan?.currentStageBasis === 'observed' && Number.isFinite(nowMs) && placementMs > nowMs + 60_000) {
+    errors.stages = 'A stage can only be marked as observed for a placement time that has already happened.';
+  }
   if (Object.keys(errors).length) return { ok: false, errors, warnings, ambiguousPlacement };
 
   const targetMs = calculateTargetMs(placementMs, wait.minutes);
-  if (!batchId) warnings.push('No batch or sample ID — consider adding one so the record can be traced later.');
-  if (reminderOffsets.length === 0) warnings.push('No reminders selected — the calendar event will have no alerts.');
+  if (stagePlan?.rangesOverlap) warnings.push('The current and target reference ranges overlap, so the estimated window starts at placement.');
   if (Number.isFinite(nowMs)) {
-    if (targetMs <= nowMs) warnings.push('The calculated target time is already in the past; the experiment will show as overdue.');
+    if (stagePlan) {
+      if (placementMs + stagePlan.windowHours[1] * 3_600_000 <= nowMs) warnings.push('The whole estimated window is already in the past.');
+    } else if (targetMs <= nowMs) warnings.push('The calculated target time is already in the past; the experiment will show as overdue.');
     if (placementMs > nowMs + 30 * MS_PER_DAY) warnings.push('Placement time is more than 30 days in the future — check the date.');
     if (placementMs < nowMs - 30 * MS_PER_DAY) warnings.push('Placement time is more than 30 days in the past — check the date.');
   }
@@ -188,6 +291,9 @@ export function validateExperimentInput(input, { existingIds = [], nowMs, minEgg
       reminderOffsets,
       notes,
       conditions,
+      temperature: temp.temperature,
+      nameIsDefault: Boolean(input.nameIsDefault) && name === str(input.defaultName),
+      ...(stagePlan ? { stagePlan } : {}),
     },
   };
 }
@@ -206,6 +312,7 @@ export function createExperiment(value, { nowMs, uid = newUid(), demo = false })
     ...value,
     eggAdjustments: [],
     observations: [],
+    retractions: [],
     originalTargetAt: value.targetAt,
     status: ms(value.placementAt) > nowMs ? STATUS.PLANNED : STATUS.ACTIVE,
     completedAt: null,
@@ -221,8 +328,18 @@ export function createExperiment(value, { nowMs, uid = newUid(), demo = false })
   record.history.push({
     at: now,
     action: 'created',
-    summary: `Created with ${value.initialEggCount} eggs, target ${formatDateTime(ms(value.targetAt), value.timeZone)}`,
+    summary: value.stagePlan
+      ? `Created with ${value.initialEggCount} eggs: ${planSummary(value.stagePlan)}, estimated window ${formatWindow(windowOf(value), value.timeZone)}`
+      : `Created with ${value.initialEggCount} eggs, target ${formatDateTime(ms(value.targetAt), value.timeZone)}`,
   });
+  // A stage the researcher says they observed at setup becomes a real observation record.
+  if (value.stagePlan?.currentStageBasis === 'observed') {
+    return addObservation(
+      record,
+      { observedAtMs: ms(value.placementAt), verdict: VERDICTS.BASELINE, observedStage: value.stagePlan.currentStage, note: 'Observed when the batch was set up', source: 'setup' },
+      { nowMs, id: `${uid}-setup` }
+    );
+  }
   return record;
 }
 
@@ -236,6 +353,8 @@ const TRACKED_FIELDS = [
   ['timeZone', 'Time zone'],
   ['waitMinutes', 'Waiting duration'],
   ['targetAt', 'Target time'],
+  ['stagePlan', 'Stage plan'],
+  ['temperature', 'Incubation temperature'],
   ['reminderOffsets', 'Reminders'],
   ['notes', 'Notes'],
   ['conditions', 'Conditions'],
@@ -245,6 +364,8 @@ function describeValue(field, value, timeZone) {
   if (value == null || value === '') return field === 'initialEggCount' ? 'not recorded' : '—';
   if (field === 'placementAt' || field === 'targetAt') return formatDateTime(ms(value), timeZone);
   if (field === 'currentIncubationMinutes' || field === 'waitMinutes') return formatDuration(value);
+  if (field === 'stagePlan') return `${planSummary(value)}; planned return: ${PLANNED_RETURN[value.plannedReturn].toLowerCase()}`;
+  if (field === 'temperature') return formatTemperature(value);
   if (field === 'reminderOffsets') return value.length ? value.map(formatReminder).join(', ') : 'none';
   const s = String(value);
   return s.length > 80 ? `${s.slice(0, 77)}…` : s;
@@ -342,7 +463,12 @@ export function markCalendarExported(record, { nowMs }) {
   const now = iso(nowMs);
   return {
     ...record,
-    calendar: { exportedAt: now, exportedTargetAt: record.targetAt, sequence: (record.calendar?.sequence ?? 0) + 1 },
+    calendar: {
+      exportedAt: now,
+      exportedTargetAt: record.targetAt,
+      exportedSignature: scheduleSignature(record),
+      sequence: (record.calendar?.sequence ?? 0) + 1,
+    },
     updatedAt: now,
     history: [
       ...record.history,
@@ -363,7 +489,35 @@ export function normalizeRecord(r) {
     initialEggCount: Number.isInteger(r.initialEggCount) ? r.initialEggCount : null,
     eggAdjustments: Array.isArray(r.eggAdjustments) ? r.eggAdjustments : [],
     observations: Array.isArray(r.observations) ? r.observations : [],
+    retractions: Array.isArray(r.retractions) ? r.retractions : [],
+    temperature: r.temperature ?? null,
+    ...(r.stagePlan ? { stagePlan: normalizeStagePlan(r.stagePlan) } : {}),
   };
+}
+
+/** Plans saved by the unreleased first stage-based form (v1) are mapped onto v2 fields. */
+function normalizeStagePlan(p) {
+  if (p.version === 2) return p;
+  return {
+    version: 2,
+    start: 'stage',
+    currentStage: p.currentStage,
+    currentStageBasis: p.currentStageBasis ?? 'selected',
+    baselineAgeHours: p.baselineAgeHours ?? p.currentAgeHours,
+    targetStage: p.targetStage,
+    targetAgeHours: p.targetAgeHours,
+    windowHours: p.windowHours ?? p.waitHours,
+    rangesOverlap: Boolean(p.rangesOverlap),
+    plannedReturn: p.plannedReturn ?? p.schedulePoint ?? 'none',
+    plannedReturnMinutes: p.plannedReturnMinutes ?? p.scheduledWaitMinutes ?? null,
+    referenceVersion: p.referenceVersion,
+  };
+}
+
+/** "Freshly set eggs → HH12" / "HH10 (selected) → HH12". */
+export function planSummary(p) {
+  const from = p.start === 'fresh' ? 'freshly set eggs (0 h)' : p.currentStage ? `HH${p.currentStage} (${p.currentStageBasis})` : `${formatHoursRange(p.baselineAgeHours)} incubation (${p.currentStageBasis})`;
+  return `${from} → HH${p.targetStage}`;
 }
 
 /**
@@ -476,21 +630,85 @@ export function formatEggs(n) {
 // change to the reference table never rewrites past records. The observed stage is kept
 // separately from the estimate and is null when the stage could not be confirmed.
 
-export const VERDICTS = Object.freeze({ MATCH: 'match', DIFFERENT: 'different', UNCONFIRMED: 'unconfirmed' });
+export const VERDICTS = Object.freeze({ MATCH: 'match', DIFFERENT: 'different', UNCONFIRMED: 'unconfirmed', BASELINE: 'baseline' });
 export const VERDICT_LABEL = {
   match: 'Matches the estimate',
   different: 'Observed stage differs from the estimate',
   unconfirmed: 'Stage not confirmed',
+  baseline: 'Observed when the batch was set up',
 };
 
-/** Calculated incubation age (minutes) at an instant: age at placement + time since placement. */
-export function incubationAgeAt(record, atMs) {
-  return record.currentIncubationMinutes + Math.max(0, Math.floor((atMs - ms(record.placementAt)) / 60_000));
+/** Incubation age at placement as [lo, hi] minutes: a stage's reference range, or exact. */
+export function baselineAgeMinutes(record) {
+  const b = record.stagePlan?.baselineAgeHours;
+  return b ? [Math.round(b[0] * 60), Math.round(b[1] * 60)] : [record.currentIncubationMinutes, record.currentIncubationMinutes];
 }
 
-/** Estimated stage snapshot for this batch at an instant (reference table only). */
+export function elapsedMinutes(record, atMs) {
+  return Math.max(0, Math.floor((atMs - ms(record.placementAt)) / 60_000));
+}
+
+/** Calculated incubation-age range [lo, hi] (minutes) at an instant: baseline range + elapsed time. */
+export function ageRangeAt(record, atMs) {
+  const [lo, hi] = baselineAgeMinutes(record);
+  const e = elapsedMinutes(record, atMs);
+  return [lo + e, hi + e];
+}
+
+/** Lower bound of the age range (exact for duration-based batches). */
+export function incubationAgeAt(record, atMs) {
+  return ageRangeAt(record, atMs)[0];
+}
+
+/** Estimated stage snapshot for this batch at an instant, carrying the age uncertainty through. */
 export function estimateStageAt(record, atMs) {
-  return estimateStage(incubationAgeAt(record, atMs));
+  const [lo, hi] = ageRangeAt(record, atMs);
+  return estimateStageForRange(lo, hi);
+}
+
+/** "48 h" or "≈ 33–38 h" for an age range in minutes. */
+export function formatAgeRange([lo, hi]) {
+  return lo === hi ? formatDuration(lo) : `≈ ${formatHoursRange([lo / 60, hi / 60])}`;
+}
+
+// ---------- retractions (append-only) ----------
+
+export function retractionFor(record, observationId) {
+  return (record.retractions ?? []).find((x) => x.observationId === observationId) ?? null;
+}
+
+export function isRetracted(record, observationId) {
+  return retractionFor(record, observationId) !== null;
+}
+
+/** Observations that count: everything except retracted ones. */
+export function activeObservations(record) {
+  return (record.observations ?? []).filter((o) => !isRetracted(record, o.id));
+}
+
+/** Retract an observation with a required reason. The original observation is never altered. */
+export function retractObservation(record, observationId, { reason, nowMs }) {
+  const o = (record.observations ?? []).find((x) => x.id === observationId);
+  if (!o) throw new Error('That observation does not exist.');
+  if (isRetracted(record, observationId)) throw new Error('This observation has already been retracted.');
+  const why = String(reason ?? '').trim();
+  if (!why) throw new RangeError('A reason is required to retract an observation.');
+  if (why.length > 1000) throw new RangeError('Reason must be 1000 characters or fewer.');
+  const at = iso(nowMs);
+  return {
+    ...record,
+    retractions: [...(record.retractions ?? []), { observationId, at, reason: why }],
+    updatedAt: at,
+    history: [
+      ...record.history,
+      {
+        at,
+        action: 'observation-retracted',
+        summary: `Retracted observation from ${formatDateTime(ms(o.observedAt), record.timeZone)} (${o.observedStage ? `HH${o.observedStage}` : 'no stage'})`,
+        reason: why,
+      },
+    ],
+  };
 }
 
 const minuteKey = (iso) => Math.floor(Date.parse(iso) / 60_000);
@@ -517,6 +735,8 @@ export function validateObservation(record, input, { nowMs }) {
   const verdict = input.verdict;
   if (!Object.values(VERDICTS).includes(verdict)) errors.verdict = 'Choose one of the three answers.';
   const stage = input.observedStage ?? null;
+  if (verdict === VERDICTS.BASELINE && !isValidStage(stage)) errors.observedStage = 'A setup observation needs a valid HH stage.';
+  if (input.temperature && !parseTemperature(input.temperature.value, input.temperature.unit).ok) errors.temperature = 'Invalid temperature.';
   if (estimate && verdict === VERDICTS.MATCH) {
     if (stage === null) errors.observedStage = `Choose which stage within ${estimate.label} you observed.`;
     else if (!stageInRange(stage, estimate.stages)) errors.observedStage = `HH${stage} is outside the estimate (${estimate.label}). Choose “No, the observed stage is different”.`;
@@ -540,20 +760,26 @@ export function addObservation(record, input, { nowMs, id = newUid() }) {
     id,
     recordedAt: iso(nowMs),
     observedAt: iso(input.observedAtMs),
-    ageMinutes: v.estimate.ageMinutes,
+    elapsedMinutes: elapsedMinutes(record, input.observedAtMs),
+    ageRangeMinutes: v.estimate.ageRangeMinutes,
+    ageMinutes: v.estimate.ageMinutes, // exact age, or null when only a range is known
     estimate: v.estimate,
     verdict: input.verdict,
     observedStage: input.verdict === VERDICTS.UNCONFIRMED ? null : input.observedStage,
     note: String(input.note ?? '').trim(),
+    temperature: input.temperature ?? null,
+    source: input.source ?? 'manual',
   };
   const existing = record.observations ?? [];
-  if (existing.some((o) => observationKey(o) === observationKey(observation))) {
+  if (activeObservations(record).some((o) => observationKey(o) === observationKey(observation))) {
     throw new DuplicateObservationError('This observation was already recorded for this batch.');
   }
   const outcome =
     observation.verdict === VERDICTS.UNCONFIRMED
       ? 'stage not confirmed'
-      : `observed HH${observation.observedStage}${observation.verdict === VERDICTS.MATCH ? ' (matches estimate)' : ' (differs from estimate)'}`;
+      : observation.verdict === VERDICTS.BASELINE
+        ? `observed HH${observation.observedStage} at setup`
+        : `observed HH${observation.observedStage}${observation.verdict === VERDICTS.MATCH ? ' (matches estimate)' : ' (differs from estimate)'}`;
   return {
     ...record,
     observations: [...existing, observation],
@@ -563,7 +789,7 @@ export function addObservation(record, input, { nowMs, id = newUid() }) {
       {
         at: iso(nowMs),
         action: 'observation',
-        summary: `Stage observation at ${formatDuration(observation.ageMinutes)} incubation: estimate ${observation.estimate.label}, ${outcome}`,
+        summary: `Stage observation at ${formatAgeRange(observation.ageRangeMinutes)} incubation: estimate ${observation.estimate.label}, ${outcome}`,
         reason: observation.note,
       },
     ],
@@ -589,12 +815,56 @@ export function isOpen(record) {
   return record.status !== STATUS.COMPLETED && record.status !== STATUS.CANCELLED;
 }
 
+/** Estimated target window for stage-based batches: { startMs, endMs }, else null. */
+export function windowOf(record) {
+  const p = record.stagePlan;
+  if (!p) return null;
+  const placement = ms(record.placementAt);
+  return { startMs: placement + p.windowHours[0] * 3_600_000, endMs: placement + p.windowHours[1] * 3_600_000 };
+}
+
+/** Planned return instant for stage-based batches (null when none chosen). */
+export function plannedReturnOf(record) {
+  const p = record.stagePlan;
+  if (!p || p.plannedReturnMinutes === null || p.plannedReturnMinutes === undefined) return null;
+  return ms(record.placementAt) + p.plannedReturnMinutes * 60_000;
+}
+
+/** 'before' | 'in' | 'after' relative to the estimated window. */
+export function windowPhase(record, nowMs) {
+  const w = windowOf(record);
+  if (!w) return null;
+  if (nowMs < w.startMs) return 'before';
+  return nowMs <= w.endMs ? 'in' : 'after';
+}
+
+export function formatWindow(w, timeZone) {
+  if (!w) return '—';
+  return `${formatDateTime(w.startMs, timeZone)} – ${formatDateTime(w.endMs, timeZone)}`;
+}
+
+/**
+ * Open batch past its schedule: a duration-based batch past its target time, or a stage-based
+ * batch whose whole estimated window has passed ("Window passed" — not a missed deadline).
+ */
 export function isOverdue(record, nowMs) {
-  return isOpen(record) && ms(record.targetAt) <= nowMs;
+  if (!isOpen(record)) return false;
+  const w = windowOf(record);
+  return w ? nowMs > w.endMs : ms(record.targetAt) <= nowMs;
 }
 
 export function isDueToday(record, nowMs) {
-  return isOpen(record) && zonedDateKey(ms(record.targetAt), record.timeZone) === zonedDateKey(nowMs, record.timeZone);
+  if (!isOpen(record)) return false;
+  const today = zonedDateKey(nowMs, record.timeZone);
+  const w = windowOf(record);
+  if (w) return zonedDateKey(w.startMs, record.timeZone) <= today && today <= zonedDateKey(w.endMs, record.timeZone);
+  return zonedDateKey(ms(record.targetAt), record.timeZone) === today;
+}
+
+/** Key that changes whenever anything shown in the calendar file changes. */
+export function scheduleSignature(record) {
+  const w = windowOf(record);
+  return w ? `${record.targetAt}|${iso(w.startMs)}|${iso(w.endMs)}|${record.stagePlan.plannedReturn}` : record.targetAt;
 }
 
 export function remainingFor(record, nowMs) {
@@ -604,7 +874,8 @@ export function remainingFor(record, nowMs) {
 /** 'none' | 'current' | 'outdated' (schedule changed after the last .ics download). */
 export function calendarState(record) {
   if (!record.calendar?.exportedAt) return 'none';
-  return record.calendar.exportedTargetAt === record.targetAt ? 'current' : 'outdated';
+  const exported = record.calendar.exportedSignature ?? record.calendar.exportedTargetAt;
+  return exported === scheduleSignature(record) ? 'current' : 'outdated';
 }
 
 /**
@@ -614,10 +885,13 @@ export function calendarState(record) {
 export function incubationTimeline(record, nowMs) {
   const placementMs = ms(record.placementAt);
   const sincePlacementMin = Math.max(0, Math.floor((nowMs - placementMs) / 60_000));
+  const base = baselineAgeMinutes(record);
   return {
     atPlacementMinutes: record.currentIncubationMinutes,
+    atPlacementRange: base,
     sincePlacementMinutes: sincePlacementMin,
     nowMinutes: nowMs >= placementMs ? record.currentIncubationMinutes + sincePlacementMin : null,
+    nowRange: nowMs >= placementMs ? [base[0] + sincePlacementMin, base[1] + sincePlacementMin] : null,
     projectedAtTargetMinutes: projectedTotalIncubationMinutes(record.currentIncubationMinutes, record.waitMinutes),
   };
 }
@@ -636,8 +910,6 @@ export function describeDelta(deltaMs) {
 export function recordWarnings(record) {
   const w = [];
   if (!isOpen(record)) return w;
-  if (!record.reminderOffsets?.length) w.push('No reminders configured.');
-  if (!record.batchId) w.push('No batch/sample ID.');
   const cal = calendarState(record);
   if (cal === 'none') w.push('Calendar event not downloaded yet.');
   if (cal === 'outdated') w.push('Schedule changed after the calendar file was downloaded — download it again.');
@@ -646,18 +918,35 @@ export function recordWarnings(record) {
 
 /** Sort open experiments by target, earliest first. */
 export function byTarget(a, b) {
-  return ms(a.targetAt) - ms(b.targetAt);
+  return sortKey(a) - sortKey(b);
+}
+
+/** Ordering instant: the window start for stage-based batches, else the target time. */
+export function sortKey(record) {
+  return windowOf(record)?.startMs ?? ms(record.targetAt);
 }
 
 // ---------- form helpers ----------
 
 export function emptyInput({ experimentId, timeZone, nowMs }) {
   const { date, time } = instantToWallInputs(nowMs, timeZone);
+  const name = defaultBatchName(nowMs, timeZone); // placement defaults to now
   return {
     experimentId,
-    name: '',
+    name,
+    nameIsDefault: true,
+    defaultName: name,
     batchId: '',
     eggCount: String(DEFAULT_EGG_COUNT),
+    timingMode: 'stage',
+    // Nothing is pre-selected: the researcher must choose the start, stages and return option.
+    start: '',
+    currentStage: '',
+    targetStage: '',
+    plannedReturn: '',
+    stageObserved: false,
+    temperatureValue: '',
+    temperatureUnit: 'C',
     currentHours: '',
     currentMinutes: '',
     placementDate: date,
@@ -683,6 +972,17 @@ export function recordToInput(record) {
     name: record.name,
     batchId: record.batchId,
     eggCount: Number.isInteger(record.initialEggCount) ? String(record.initialEggCount) : '',
+    // Records without a stage plan keep their entered durations (never recalculated).
+    timingMode: record.stagePlan ? 'stage' : 'duration',
+    start: record.stagePlan?.start ?? '',
+    currentStage: record.stagePlan?.currentStage ?? '',
+    targetStage: record.stagePlan?.targetStage ?? '',
+    plannedReturn: record.stagePlan?.plannedReturn ?? '',
+    stageObserved: record.stagePlan?.currentStageBasis === 'observed',
+    temperatureValue: record.temperature ? String(record.temperature.value) : '',
+    temperatureUnit: record.temperature?.unit ?? 'C',
+    nameIsDefault: Boolean(record.nameIsDefault),
+    defaultName: record.nameIsDefault ? record.name : '',
     currentHours: String(cur.hours),
     currentMinutes: cur.minutes ? String(cur.minutes) : '',
     placementDate: date,
@@ -701,13 +1001,58 @@ export function recordToInput(record) {
 export function duplicateToInput(record, { experimentId, nowMs }) {
   const input = recordToInput(record);
   const { date, time } = instantToWallInputs(nowMs, record.timeZone);
+  const fresh = defaultBatchName(nowMs, record.timeZone);
   return {
     ...input,
     experimentId,
-    name: `${record.name} (copy)`,
+    name: record.nameIsDefault ? fresh : `${record.name} (copy)`,
+    nameIsDefault: Boolean(record.nameIsDefault),
+    defaultName: record.nameIsDefault ? fresh : '',
+    // An observation belongs to the original batch only.
+    stageObserved: false,
     eggCount: input.eggCount || String(DEFAULT_EGG_COUNT),
     placementDate: date,
     placementTime: time,
     placementOccurrence: 'first',
   };
+}
+
+// ---------- converting older duration-based batches ----------
+
+/**
+ * Explicitly convert a duration-based batch to stage-based timing. The entered incubation age at
+ * placement is used as an exact baseline (it was entered, not estimated); the original wait and
+ * target are kept in the history and in stagePlan.convertedFrom. Observations are untouched.
+ */
+export function convertToStagePlan(record, { targetStage, plannedReturn, nowMs, reason = '' }) {
+  if (record.stagePlan) throw new Error('This batch already uses stage-based timing.');
+  if (!isOpen(record)) throw new Error('Only open batches can be converted.');
+  if (!Number.isFinite(record.currentIncubationMinutes)) {
+    throw new Error('This batch has no recorded incubation age at placement, so a stage window cannot be calculated.');
+  }
+  if (!isValidStage(targetStage)) throw new RangeError('Choose a target HH stage from 2 to 46.');
+  if (getStage(targetStage).minHours === null) throw new RangeError(`HH${targetStage} has no reference age. Choose HH2 or later.`);
+  if (!Object.hasOwn(PLANNED_RETURN, plannedReturn ?? '')) throw new RangeError('Choose whether to plan a specific return time.');
+  const age = record.currentIncubationMinutes / 60;
+  const p = windowPlan({ baseline: [age, age], basis: 'entered-duration', start: 'entered', targetStage, plannedReturn });
+  if (!p.ok) throw new RangeError(p.error);
+  const now = iso(nowMs);
+  const plan = { ...p.plan, convertedFrom: { at: now, waitMinutes: record.waitMinutes, targetAt: record.targetAt } };
+  const placement = ms(record.placementAt);
+  const newWait = plan.plannedReturnMinutes ?? Math.round(plan.windowHours[0] * 60);
+  const next = { ...record, stagePlan: plan, waitMinutes: newWait, targetAt: iso(placement + newWait * 60_000), updatedAt: now };
+  next.history = [
+    ...record.history,
+    {
+      at: now,
+      action: 'converted-to-stage',
+      summary: `Converted to stage-based timing: ${planSummary(plan)}, estimated window ${formatWindow(windowOf(next), record.timeZone)}`,
+      reason: String(reason).trim(),
+      changes: [
+        { field: 'waitMinutes', label: 'Waiting duration', from: formatDuration(record.waitMinutes), to: plan.plannedReturnMinutes === null ? 'window only' : formatDuration(newWait) },
+        { field: 'targetAt', label: 'Target time', from: formatDateTime(ms(record.targetAt), record.timeZone), to: formatWindow(windowOf(next), record.timeZone) },
+      ],
+    },
+  ];
+  return next;
 }

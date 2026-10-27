@@ -1,7 +1,7 @@
 // App shell: routing, state, persistence wiring and the 1-second countdown ticker.
 
 import { html, mount, toast } from './ui/dom.js';
-import { countdownText, errorPanel, formatLongDuration } from './ui/components.js';
+import { countdownText, errorPanel, formatLongDuration, windowPhaseAt, windowText } from './ui/components.js';
 import { createLocalRepository, createProfileStore, PROFILE_KEY, STORAGE_KEY } from './storage.js';
 import { getSystemTimeZone, zonedDateKey } from './time.js';
 import { renderHatchery } from './ui/views/hatchery.js';
@@ -151,6 +151,17 @@ let lastMinute = Math.floor(Date.now() / 60_000);
 function tick() {
   const now = ctx.now();
   let flipped = false;
+  for (const el of main.querySelectorAll('[data-window-start]')) {
+    const start = Number(el.dataset.windowStart);
+    const end = Number(el.dataset.windowEnd);
+    const phase = windowPhaseAt(start, end, now);
+    if (phase !== el.dataset.phase) {
+      flipped = true;
+      el.classList.replace(`phase-${el.dataset.phase}`, `phase-${phase}`);
+      el.dataset.phase = phase;
+    }
+    el.textContent = windowText(start, end, now);
+  }
   for (const el of main.querySelectorAll('[data-countdown]')) {
     const target = Number(el.dataset.countdown);
     const overdue = target <= now;
@@ -184,7 +195,7 @@ function tick() {
   if (document.getElementById('dialog').open) return;
   if (state.view?.tickRerender) ctx.rerender();
   else state.view?.onFlip?.();
-  if (flipped && state.route?.name !== 'form') toast('An experiment has reached its target time.', 'warn');
+  if (flipped && state.route?.name !== 'form') toast('A batch schedule changed state (target reached or estimated window opened/closed).', 'warn');
 }
 
 // ---------- start ----------

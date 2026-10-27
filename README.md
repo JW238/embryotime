@@ -9,46 +9,62 @@ predict developmental stages or outcomes.
 
 ## Run it
 
-Requires Node.js 18 or newer. There are no dependencies to install.
+Requires Node.js 22 or newer. There are no npm dependencies.
 
 ```bash
 npm start
 ```
 
-Then open <http://localhost:5173>. (The app uses ES modules, so it must be served over HTTP — opening
-`index.html` directly from disk will not work.) Set `PORT=8080 npm start` to use another port.
+Then open <http://localhost:5173>. This serves the source files directly, for development.
 
-Run the tests:
+| Command | What it does |
+|---|---|
+| `npm test` | Unit tests (calculations, model, exports, backups, release build, contrast) |
+| `npm run test:browser` | End-to-end tests in headless Chrome against the **built release** |
+| `npm run test:all` | Both |
+| `npm run build` | Writes the release into `docs/` (what GitHub Pages serves) |
+| `npm run start:release` | Builds into `.release-preview/` and serves it exactly as published |
 
-```bash
-npm test
-```
+Browser tests drive an installed Chrome or Chromium through the DevTools protocol, using Node's
+built-in WebSocket and no npm packages. If Chrome is not at a standard location, set
+`CHROME_PATH`. Without a browser, those tests are reported as **skipped**, never as passed.
 
 ## Public preview (GitHub Pages)
 
-The app is a static site: `index.html`, `styles.css` and the ES modules in `src/`. It has no
-backend. `server.js` is only a local development server, and nothing in the app calls it.
-
 - **Live URL:** https://jw238.github.io/embryotime/
-- **Hosting:** GitHub Pages, served directly from the `main` branch (repository root). There's
-  no build step. `.nojekyll` tells Pages to serve the files as-is.
-- **Routing:** pages use hash URLs (`#/history`, `#/exp/…`), so refreshing and opening links
-  directly work with no server rewrite rules.
-- **Access:** the site and this repository are **public**. Anyone with the URL can open it.
-  There is **no login, no database and no data sharing**:
-  - each visitor's experiments live only in that visitor's browser (`localStorage`), per device;
-  - nothing is uploaded anywhere, and colleagues cannot see each other's data;
-  - a link to a specific experiment (`#/exp/…`) only works in the browser that created it;
-  - data saved at `localhost:5173` does not appear on the public site (different origin);
-  - a notice at the top of the page explains this to visitors.
-- **Security:** a Content-Security-Policy `<meta>` tag allows only the site's own scripts and
-  styles (no third-party requests), and `no-referrer` is set. Don't commit secrets or real
-  experiment data. `.gitignore` excludes local tooling (`.claude/`), `.env*` and OS files.
+- **Access:** the site and repository are **public**. Anyone with the URL can open it. There is
+  no login, database, email or data sharing:
+  - each visitor's batches live only in their own browser (`localStorage`);
+  - nothing is uploaded;
+  - a link to a batch only works in the browser that created it.
+
+### Releases and caching
+
+GitHub Pages lets browsers cache each file for up to 10 minutes, independently. To stop an old
+`index.html` from loading new JavaScript (or the reverse), `npm run build` writes every release
+into an immutable, **content-hashed folder**:
+
+```
+docs/index.html            → points only at r/<hash>/…
+docs/r/<hash>/styles.css
+docs/r/<hash>/src/**.js    (relative imports: a page can only load modules from its own release)
+docs/release.json          (current release + the last 5 kept for cached pages)
+```
+
+The build fails if any module imports something outside its release folder, imports a missing
+file, or uses a non-relative URL. `--seed-legacy <git-ref>` additionally copies an earlier
+un-versioned deployment's files into `docs/`, so pages cached from before this scheme still load a
+consistent set.
+
+GitHub Pages is configured to serve the `docs/` folder of `main` (Settings → Pages).
 
 ### Updating the site
 
 ```bash
-npm test
+npm run test:all
+```
+```bash
+npm run build
 ```
 ```bash
 git add -A && git commit -m "Describe the change"
@@ -57,18 +73,10 @@ git add -A && git commit -m "Describe the change"
 git push
 ```
 
-GitHub Pages republishes automatically within a minute or two of each push. You can follow
-progress with `gh run list` or under the repository's **Actions** tab.
-
-GitHub Pages tells browsers they may reuse files for up to **10 minutes** (`max-age=600`), and
-this can't be configured. After an update, visitors may see the previous version for a few
-minutes. A hard refresh (Cmd+Shift+R on Mac, Ctrl+Shift+R on Windows) loads the new one
-immediately. Visitors' saved experiments are not affected by updates.
-
 ### Taking it down
 
-Disable Pages under **Settings → Pages** in the repository, or make the repository private.
-Note that on a free GitHub plan, Pages needs a public repository.
+Disable Pages under **Settings → Pages**, or make the repository private (on a free plan, Pages
+needs a public repository).
 
 ## How the calculation works
 
@@ -121,6 +129,68 @@ time, target time, reminders and status. Eggs are **counted, not tracked one by 
 - CSV export has columns for initial, active, completed, removed and cancelled eggs. The .ics
   description includes the egg count.
 
+## Adding a batch (stage-based timing)
+
+Nothing is pre-selected. You choose:
+
+1. **Batch name.** Generated from the *placement* date and time (e.g. "October 26, 2026 — 8:15 PM")
+   and updated if you change the placement time. Once you type your own name, it is never
+   overwritten. A record ID (`EXP-YYYYMMDD-NNN`) is still assigned automatically and shown in
+   details, CSV and history. Older records without a name show their ID.
+2. **Starting point:**
+   - **Freshly set eggs — incubation age 0 h.** A known elapsed time, not an observed HH1 stage.
+   - **Current HH stage.** The age is taken as that stage's listed reference range. Ticking
+     *I observed this stage* saves a real **setup observation**; otherwise the stage is recorded as
+     *selected*.
+3. **Target HH stage.** Must be later than the current stage. HH1 cannot be used, because the
+   table lists no age for it, so you are pointed to "freshly set eggs" instead.
+4. **Planned lab return.** None (track the window only), or the start, middle or end of the
+   window. Each option explains its trade-off. The middle is a convention, not an optimum.
+
+Stage wheels have a number box beside them. They work with keyboard, scrolling or tapping, and
+nothing is selected until you choose. Calendar alerts are visible and **off unless chosen**.
+Temperature is optional and stored with its unit. **Estimates are never adjusted for
+temperature**: there is no validated correction model here, and the UNSW page does not state the
+conditions behind its ages (`REFERENCE_TEMPERATURE_C` in `src/experiment.js` stays `null`
+unless filled from a reliable source).
+
+### Calculation: ranges all the way through
+
+```
+starting age  = [0, 0] (fresh) · [cMin, cMax] (current stage) · [x, x] (converted older batch)
+window        = placement + [max(0, tMin − startMax), tMax − startMin]
+age at time t = starting age + (t − placement)        ← still a range; never a midpoint
+estimated stage at t = every HH stage whose listed range overlaps that age range
+```
+
+Example: HH10 (33–38 h) → HH12 (45–49 h), placed 20:15. The estimated window is **7–16 h** after
+placement, i.e. 03:15–12:15 the next day. Ten hours after placement the age is 43–48 h, so the
+estimate is HH11–HH13.
+
+Overlapping ranges (HH13 → HH14) give a window that starts at placement. This is flagged, and
+"start of window" is refused because it would mean no wait.
+
+This interval arithmetic only combines the table's listed ranges. It does **not** capture all
+biological variation, and the target stage is never guaranteed at an exact time. Each plan stores
+its reference version.
+
+### Window states
+
+Stage-based batches show **"Window opens in…" → "In window · closes in…" → "Window passed"** in
+every view, rather than a deadline. The calendar shows them on every day the window covers, and
+the `.ics` file contains one event spanning the whole window (plus a separate "planned lab
+return" event only if one was chosen). Older duration-based batches keep their single target time
+and "Overdue".
+
+### Older batches
+
+Duration-based batches are never recalculated. They edit with duration wheels.
+**Convert to stage-based timing…** (batch page) asks for confirmation:
+- it uses the entered incubation age as an exact start;
+- it records the old wait and target in the history and in `stagePlan.convertedFrom`;
+- it leaves observations untouched;
+- it refuses (with an explanation) when the entered age is already past the chosen target.
+
 ## HH stages, observations and the Egg collection
 
 **Reference data.** `src/hh-stages.js` holds Hamburger–Hamilton stages 1–46 with the reference
@@ -160,7 +230,13 @@ verdict, observedStage, note }`:
   a Skip button. Viewing a batch never prompts.
 - Saving the same batch, minute, answer and stage twice is rejected as a duplicate.
 
-**Chart** (batch details). The x-axis is calculated incubation age and the y-axis is HH stage:
+**Retracting.** An incorrect observation can be **retracted with a required reason**. The
+original is never altered: the retraction is appended to `record.retractions` and to the history.
+Retracted observations are excluded from the chart, conflict checks and badges. They stay in the
+observation table (struck through, with reason) and in the observations CSV, marked
+`retracted`.
+
+**Chart** (batch details). The x-axis is time since placement (exact) and the y-axis is HH stage; the reference band carries the starting-age range:
 - the shaded band is the reference estimate;
 - a bracket shows the estimate stored with each observation;
 - observations use shapes: ● matches, ◆ different (same colour), and ○ in a separate
@@ -246,6 +322,24 @@ analytics for now.
 
 ## Storage and its limits
 
+**Backup status.** History (and the hatchery, when needed) shows when a backup **download was
+started**. The browser cannot confirm the file was saved, so it never says "backed up". It warns
+when there is no backup, when batches changed since the last one, or when the last one is older than
+7 days (`BACKUP_MAX_AGE_DAYS`).
+
+**Restore** validates the whole file before touching anything:
+- schema and version;
+- field types and unique IDs;
+- HH stages and reference-age ranges;
+- timestamps and time zones;
+- egg counts and statuses;
+- observations, retractions and stage plans.
+
+Any problem → nothing is changed and every problem is listed. On success, after confirmation, the
+current data is first copied to `embryotime.experiments.v1.pre-restore-<time>`. Older backup
+formats are migrated explicitly; missing scientific values are never invented.
+
+
 Experiments carry a `coopId` (currently always `personal`; older records without one are treated as
 personal). The researcher's display name and coop name are stored separately under
 `embryotime.profile.v1`.
@@ -278,12 +372,19 @@ src/demo.js                Demo records
 src/hatchery.js            Egg stages, progress, hen messages, coop membership (pure)
 src/ui/art.js              Inline SVG illustrations (egg, nest, hen, chick, flowers, hills)
 src/ui/celebrate.js        Non-blocking save/complete animations
+scripts/build.mjs          Content-hashed release build + import checks
+tests/browser/             Headless-Chrome end-to-end tests (zero-dependency CDP driver)
 src/app.js                 Router, state, 1-second countdown ticker
 src/ui/                    DOM helpers, shared components, actions/dialogs, views
 tests/                     node:test suites for the logic modules
 ```
 
 ## Known limitations
+
+- Stage windows come only from the reference table's listed ranges. Real embryos can fall outside
+  them, and temperature effects are not modelled.
+- Retracted observations cannot be "un-retracted"; record the observation again instead.
+- Backup status records download *starts*; whether the file was saved cannot be verified.
 
 - Local, single-user storage only (see above).
 - No direct Google/Apple/Outlook calendar sync. The `.ics` file is imported manually, and if the
@@ -302,10 +403,10 @@ tests/                     node:test suites for the logic modules
 - Egg counts are limited to 10–50 per batch in this version.
 - Stage estimates are only as precise as the reference table's listed ages. Individual embryos
   and incubation conditions vary.
-- Observations describe a batch, not individual eggs, and can't be edited or deleted from the
-  interface; they're kept as a permanent log.
-- The chart and observation table are in the batch details only. History/CSV export doesn't
-  include observations yet.
+- Observations describe a batch, not individual eggs. They can't be edited or deleted; an incorrect one
+  is retracted with a reason and kept in the audit trail.
+- The chart is in the batch details only. Observations are exported via History → Export
+  observations CSV.
 - Shared laboratory, multiple coops and multi-user features (2.0 spec §4 onward) are not built
   yet. They need a server and accounts. The data model has a `coopId` field ready for them.
 - Reduced-motion styling was checked by inspecting the CSS rules, not by running with the OS

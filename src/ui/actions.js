@@ -5,7 +5,15 @@ import {
   VERDICTS,
   addObservation,
   adjustEggCount,
+  convertToStagePlan,
+  displayName,
   estimateStageAt,
+  formatAgeRange,
+  formatTemperature,
+  formatWindow,
+  parseTemperature,
+  retractObservation,
+  windowOf,
   cancelExperiment,
   completeExperiment,
   eggCounts,
@@ -15,27 +23,28 @@ import {
 } from '../experiment.js';
 import { buildIcs, icsFileName } from '../ics.js';
 import { buildDemoExperiments } from '../demo.js';
+import { buildBackup, createBackupMetaStore } from '../storage.js';
 import { celebrateBadge, celebrateHatch } from './celebrate.js';
 import { attachWheels, getWheelValue, stageReference, stageWheel } from './wheel.js';
-import { ESTIMATE_METHOD_TEXT, HH_MAX, HH_MIN } from '../hh-stages.js';
+import { ESTIMATE_METHOD_TEXT, HH_MAX, HH_MIN, PLANNED_RETURN, PLANNED_RETURN_HELP, formatHoursRange, getStage, windowPlan } from '../hh-stages.js';
 import { countObservations, createBadgeStore, syncUnlocks } from '../badges.js';
 import { formatDateTime, formatDuration, instantToWallInputs, zonedWallTimeToInstant } from '../time.js';
 
-const ACTIONS = new Set(['ics', 'complete', 'cancel', 'reopen', 'duplicate', 'delete', 'eggs-remove', 'eggs-complete', 'observe']);
+const ACTIONS = new Set(['ics', 'complete', 'cancel', 'reopen', 'duplicate', 'delete', 'eggs-remove', 'eggs-complete', 'observe', 'retract', 'convert']);
 
 export function bindActions(root, ctx) {
   root.addEventListener('click', (e) => {
     const el = e.target.closest('[data-action]');
     if (!el || !root.contains(el) || !ACTIONS.has(el.dataset.action)) return;
     e.preventDefault();
-    handleAction(el.dataset.action, el.dataset.uid, ctx);
+    handleAction(el.dataset.action, el.dataset.uid, ctx, el.dataset);
   });
 }
 
-export async function handleAction(action, uid, ctx) {
+export async function handleAction(action, uid, ctx, data = {}) {
   const record = ctx.find(uid);
   if (!record) {
-    toast('That experiment no longer exists.', 'error');
+    toast('That batch no longer exists.', 'error');
     return;
   }
   try {
@@ -58,6 +67,12 @@ export async function handleAction(action, uid, ctx) {
       case 'observe':
         openObservationDialog(record, ctx);
         break;
+      case 'retract':
+        openRetractDialog(record, data.obs, ctx);
+        break;
+      case 'convert':
+        openConvertDialog(record, ctx);
+        break;
       case 'eggs-remove':
         openEggCountDialog(record, 'removed', ctx);
         break;
@@ -66,16 +81,16 @@ export async function handleAction(action, uid, ctx) {
         break;
       case 'reopen':
         await ctx.save(reopenExperiment(record, { nowMs: ctx.now() }));
-        toast(`${record.experimentId} reopened.`);
+        toast(`“${displayName(record)}” reopened.`);
         ctx.rerender();
         break;
       case 'duplicate':
         ctx.navigate(`#/new?from=${encodeURIComponent(uid)}`);
         break;
       case 'delete':
-        if (!window.confirm(`Permanently delete ${record.experimentId} and its history from this browser? This cannot be undone.`)) return;
+        if (!window.confirm(`Permanently delete “${displayName(record)}” (${record.experimentId}) and its history from this browser? This cannot be undone.`)) return;
         await ctx.remove(uid);
-        toast(`${record.experimentId} deleted.`);
+        toast(`“${displayName(record)}” deleted.`);
         ctx.navigate('#/');
         break;
     }
@@ -87,10 +102,24 @@ export async function handleAction(action, uid, ctx) {
 /** Show the shared <dialog>. onSubmit(formData) returns an error string to keep it open. */
 export function openDialog(content, onSubmit) {
   const dialog = document.getElementById('dialog');
+  // Return focus to whatever opened the dialog (Escape and Cancel both close it).
+  const opener = document.activeElement;
   dialog.innerHTML = String(content);
   const form = dialog.querySelector('form');
   const errorEl = dialog.querySelector('.dialog-error');
+  const heading = dialog.querySelector('h2');
+  if (heading) {
+    heading.id = 'dialog-title';
+    dialog.setAttribute('aria-labelledby', 'dialog-title');
+  }
   dialog.querySelector('[data-close]').addEventListener('click', () => dialog.close());
+  dialog.addEventListener(
+    'close',
+    () => {
+      if (opener && opener.isConnected && typeof opener.focus === 'function') opener.focus();
+    },
+    { once: true }
+  );
   let busy = false;
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -113,6 +142,8 @@ export function openDialog(content, onSubmit) {
     dialog.close();
   });
   dialog.showModal();
+  // Focus the first field rather than the close button.
+  dialog.querySelector('input:not([type=hidden]), textarea, select')?.focus();
   return dialog;
 }
 
@@ -121,8 +152,8 @@ function openCompleteDialog(record, ctx) {
   const now = instantToWallInputs(ctx.now(), tz);
   const dialog = openDialog(
     html`<form class="dialog-form" novalidate>
-      <h2>Mark ${record.experimentId} as completed</h2>
-      <p class="muted">Planned target: ${formatDateTime(Date.parse(record.targetAt), tz)}</p>
+      <h2>Mark “${displayName(record)}” as completed</h2>
+      <p class="muted">${windowOf(record) ? html`Estimated window: ${formatWindow(windowOf(record), tz)}` : html`Planned target: ${formatDateTime(Date.parse(record.targetAt), tz)}`}</p>
       <fieldset>
         <legend>Actual completion time <span class="muted">(${tz})</span></legend>
         <div class="row">
@@ -278,7 +309,7 @@ export function openObservationDialog(record, ctx, { afterCompletion = false } =
   const dialog = openDialog(
     html`<form class="dialog-form obs-form" novalidate>
       <h2>${afterCompletion ? 'Final stage check (optional)' : 'Record a stage observation'}</h2>
-      <p class="muted">${record.experimentId} · ${record.name}. One observation describes the batch as a whole.</p>
+      <p class="muted">“${displayName(record)}” (${record.experimentId}). One observation describes the batch as a whole.</p>
       <fieldset>
         <legend>Observation time <span class="muted">(${tz})</span></legend>
         <div class="row">
@@ -293,6 +324,18 @@ export function openObservationDialog(record, ctx, { afterCompletion = false } =
         ${VERDICT_CHOICES.map(([v, label]) => html`<label class="check"><input type="radio" name="verdict" value="${v}" required> ${label}</label>`)}
       </fieldset>
       <div class="obs-stage" data-stage-pick hidden></div>
+      <div class="field">
+        <label for="obs-temp">Incubator temperature at observation <span class="muted">(optional)</span></label>
+        <div class="row">
+          <input id="obs-temp" name="tempValue" class="temp-input" inputmode="decimal" placeholder="${record.temperature ? String(record.temperature.value) : 'e.g. 37.5'}">
+          <label class="sr-only" for="obs-temp-unit">Unit</label>
+          <select id="obs-temp-unit" name="tempUnit">
+            <option value="C" ${record.temperature?.unit !== 'F' ? 'selected' : ''}>°C</option>
+            <option value="F" ${record.temperature?.unit === 'F' ? 'selected' : ''}>°F</option>
+          </select>
+        </div>
+        <p class="hint">Recorded with this observation only; it never changes the estimate.</p>
+      </div>
       <label class="field">Observation note <span class="muted">(optional)</span><textarea name="note" rows="2" maxlength="2000"></textarea></label>
       <p class="hint">Observed stages are saved separately from the estimate. A difference is useful data, not an error.</p>
       <p class="dialog-error field-error" role="alert" hidden></p>
@@ -306,7 +349,9 @@ export function openObservationDialog(record, ctx, { afterCompletion = false } =
       if (!at.ok) return at.error;
       const verdict = data.get('verdict');
       if (!verdict) return 'Choose one of the three answers.';
-      const input = { observedAtMs: at.instantMs, verdict, observedStage: pickedStage(verdict, at.instantMs), note: data.get('note') };
+      const temp = parseTemperature(data.get('tempValue'), data.get('tempUnit'));
+      if (!temp.ok) return temp.error;
+      const input = { observedAtMs: at.instantMs, verdict, observedStage: pickedStage(verdict, at.instantMs), note: data.get('note'), temperature: temp.temperature };
       const v = validateObservation(ctx.find(record.uid) ?? record, input, { nowMs: ctx.now() });
       if (!v.ok) return Object.values(v.errors)[0];
       const updated = addObservation(ctx.find(record.uid) ?? record, input, { nowMs: ctx.now() });
@@ -345,8 +390,8 @@ export function openObservationDialog(record, ctx, { afterCompletion = false } =
     }
     estimate = estimateStageAt(record, at);
     estimateEl.innerHTML = String(html`<div class="label">Estimated stage <span class="est-tag">estimate</span></div>
-      <p><strong>${estimate.label}</strong> at ${formatDuration(estimate.ageMinutes)} calculated incubation.
-      <span class="hint block">${ESTIMATE_METHOD_TEXT[estimate.method]} Uses the HH reference ages only.</span></p>`);
+      <p><strong>${estimate.label}</strong> at ${formatAgeRange(estimate.ageRangeMinutes)} calculated incubation.
+      <span class="hint block">${estimate.ageMinutes === null ? 'The age is a range because the batch started from a stage’s reference range. ' : ''}${ESTIMATE_METHOD_TEXT[estimate.method]} Uses the HH reference ages only.</span></p>`);
   }
 
   function renderPick() {
@@ -363,15 +408,15 @@ export function openObservationDialog(record, ctx, { afterCompletion = false } =
     if (verdict === VERDICTS.MATCH && lo === hi) {
       content = html`<div class="label">Observed stage</div>${stageReference(lo)}`;
     } else if (verdict === VERDICTS.MATCH) {
-      const value = prevValue >= lo && prevValue <= hi ? prevValue : lo;
+      // No pre-selected stage: the researcher picks explicitly.
+      const value = prevValue !== null && prevValue >= lo && prevValue <= hi ? prevValue : null;
       content = html`<div class="obs-pick"><div><div class="label" id="pick-label">Which stage within ${estimate.label}?</div>
-        ${stageWheel({ id: 'obs-stage', from: lo, to: hi, value, describedBy: 'pick-label' })}</div>
+        ${stageWheel({ id: 'obs-stage', from: lo, to: hi, value, describedBy: 'pick-label', numberInput: true })}</div>
         <div data-ref>${stageReference(value)}</div></div>`;
     } else {
-      const outside = hi < HH_MAX ? hi + 1 : lo - 1;
-      const value = prevValue !== null && (prevValue < lo || prevValue > hi) ? prevValue : outside;
+      const value = prevValue !== null && (prevValue < lo || prevValue > hi) ? prevValue : null;
       content = html`<div class="obs-pick"><div><div class="label" id="pick-label">Observed HH stage</div>
-        ${stageWheel({ id: 'obs-stage', from: HH_MIN, to: HH_MAX, value, describedBy: 'pick-label' })}</div>
+        ${stageWheel({ id: 'obs-stage', from: HH_MIN, to: HH_MAX, value, describedBy: 'pick-label', numberInput: true })}</div>
         <div data-ref>${stageReference(value)}</div></div>`;
     }
     pick.innerHTML = String(content);
@@ -396,3 +441,112 @@ export function openObservationDialog(record, ctx, { afterCompletion = false } =
   });
   renderEstimate();
 }
+
+/** Retract an observation (reason required). The original stays in the record and exports. */
+function openRetractDialog(record, observationId, ctx) {
+  const o = (record.observations ?? []).find((x) => x.id === observationId);
+  if (!o) {
+    toast('That observation no longer exists.', 'error');
+    return;
+  }
+  openDialog(
+    html`<form class="dialog-form" novalidate>
+      <h2>Retract observation</h2>
+      <p>${formatDateTime(Date.parse(o.observedAt), record.timeZone)} · ${o.observedStage ? `observed HH${o.observedStage}` : 'stage not confirmed'}${o.note ? ` · “${o.note}”` : ''}</p>
+      <p class="muted">The observation is not deleted. It stays in the history and in exports, marked as retracted, and stops counting toward charts and badges.</p>
+      <label class="field">Reason <span class="req" aria-hidden="true">*</span><textarea name="reason" rows="2" maxlength="1000" required></textarea></label>
+      <p class="dialog-error field-error" role="alert" hidden></p>
+      <div class="dialog-actions">
+        <button type="button" class="btn btn-ghost" data-close>Keep observation</button>
+        <button type="submit" class="btn btn-danger">Retract</button>
+      </div>
+    </form>`,
+    async (data) => {
+      const reason = String(data.get('reason') ?? '').trim();
+      if (!reason) return 'Please give a reason. It is kept in the audit history.';
+      await ctx.save(retractObservation(ctx.find(record.uid) ?? record, observationId, { reason, nowMs: ctx.now() }));
+      toast('Observation retracted. The original is kept in the history.');
+      ctx.rerender();
+      return null;
+    }
+  );
+}
+
+/** Explicit, confirmed conversion of a duration-based batch to stage-based timing. */
+function openConvertDialog(record, ctx) {
+  const tz = record.timeZone;
+  const ageH = record.currentIncubationMinutes / 60;
+  const dialog = openDialog(
+    html`<form class="dialog-form obs-form" novalidate>
+      <h2>Convert “${displayName(record)}” to stage-based timing</h2>
+      <p>The incubation age you entered at placement (<strong>${formatAgeRange([record.currentIncubationMinutes, record.currentIncubationMinutes])}</strong>) is used as an exact starting age.
+        The target stage’s reference age range then gives an <strong>estimated window</strong>:</p>
+      <p class="calc-line">window = placement + (target reference min − ${+ageH.toFixed(2)} h) … placement + (target reference max − ${+ageH.toFixed(2)} h)</p>
+      <p class="muted">Current target ${formatDateTime(Date.parse(record.targetAt), tz)} (wait ${formatDuration(record.waitMinutes)}) is kept in the history. Observations are not changed. This cannot be undone automatically.</p>
+      <div class="obs-pick">
+        <div><div class="label" id="conv-label">Target HH stage</div>
+          ${stageWheel({ id: 'conv-stage', from: 2, to: HH_MAX, value: null, describedBy: 'conv-label', numberInput: true })}</div>
+        <div data-ref>${stageReference(null)}</div>
+      </div>
+      <fieldset class="field planned-return">
+        <legend>Planned lab return</legend>
+        ${Object.entries(PLANNED_RETURN).map(
+          ([k, label]) => html`<label class="check"><input type="radio" name="plannedReturn" value="${k}"> ${label}</label>`
+        )}
+        <p class="hint" data-return-help></p>
+      </fieldset>
+      <div class="obs-estimate" data-preview aria-live="polite"><p class="muted">Choose a target stage to see the estimated window.</p></div>
+      <label class="field">Reason <span class="muted">(optional, saved in history)</span><input name="reason"></label>
+      <p class="dialog-error field-error" role="alert" hidden></p>
+      <div class="dialog-actions">
+        <button type="button" class="btn btn-ghost" data-close>Cancel</button>
+        <button type="submit" class="btn btn-primary">Convert</button>
+      </div>
+    </form>`,
+    async (data) => {
+      const w = dialog.querySelector('#conv-stage');
+      const stage = getWheelValue(w);
+      if (stage === null) return 'Choose a target HH stage.';
+      if (!data.get('plannedReturn')) return 'Choose whether to plan a specific return time.';
+      const converted = convertToStagePlan(ctx.find(record.uid) ?? record, { targetStage: stage, plannedReturn: data.get('plannedReturn'), nowMs: ctx.now(), reason: data.get('reason') });
+      await ctx.save(converted);
+      toast('Converted. The original durations are kept in the history.');
+      ctx.rerender();
+      return null;
+    }
+  );
+  const w = dialog.querySelector('#conv-stage');
+  const form = dialog.querySelector('form');
+  attachWheels(dialog);
+  const preview = () => {
+    const stage = getWheelValue(w);
+    dialog.querySelector('[data-ref]').innerHTML = String(stageReference(stage));
+    const ret = form.plannedReturn.value;
+    dialog.querySelector('[data-return-help]').textContent = ret ? PLANNED_RETURN_HELP[ret] : '';
+    const box = dialog.querySelector('[data-preview]');
+    if (stage === null) return;
+    const p = windowPlan({ baseline: [ageH, ageH], basis: 'entered-duration', start: 'entered', targetStage: stage, plannedReturn: ret || 'none' });
+    if (!p.ok) {
+      box.innerHTML = String(html`<p class="alert alert-warn">${p.error}</p>`);
+      return;
+    }
+    const placement = Date.parse(record.placementAt);
+    const t = getStage(stage);
+    box.innerHTML = String(html`<div class="label">Estimated window <span class="est-tag">estimate</span></div>
+      <p><strong>${formatWindow({ startMs: placement + p.plan.windowHours[0] * 3_600_000, endMs: placement + p.plan.windowHours[1] * 3_600_000 }, tz)}</strong>
+      <span class="hint block">HH${stage} reference ${formatHoursRange([t.minHours, t.maxHours])} − entered ${+ageH.toFixed(2)} h = ${formatHoursRange(p.plan.windowHours)} after placement.</span></p>`);
+  };
+  w.addEventListener('wheelchange', preview);
+  form.addEventListener('change', preview);
+}
+
+/** Download a full backup and remember that a download was started (not that it was saved). */
+export function downloadBackup(ctx, after) {
+  const stamp = new Date(ctx.now()).toISOString().slice(0, 10);
+  const payload = JSON.stringify(buildBackup(ctx.experiments, ctx.now()), null, 2);
+  downloadFile(`embryotime-backup-${stamp}.json`, payload, 'application/json');
+  createBackupMetaStore().recordDownload(ctx.now(), ctx.experiments.length);
+  toast('Backup download started. Check that the file was saved in your downloads.');
+  after?.();
+}
+

@@ -1,10 +1,11 @@
 // Searchable experiment history, CSV export and JSON backup.
 
 import { html, mount, downloadFile, toast } from '../dom.js';
-import { countdown, eggSummary, emptyState, statusBadge, totalsStrip } from '../components.js';
-import { STATUS_LABEL, batchTotals, describeDelta, effectiveStatus, isOverdue } from '../../experiment.js';
-import { experimentsToCsv } from '../../csv.js';
-import { validateImportedRecords } from '../../storage.js';
+import { backupStatusPanel, countdown, eggSummary, emptyState, statusBadge, totalsStrip } from '../components.js';
+import { STATUS_LABEL, batchTotals, describeDelta, displayName, effectiveStatus, formatWindow, isOverdue, windowOf } from '../../experiment.js';
+import { experimentsToCsv, observationsToCsv } from '../../csv.js';
+import { createBackupMetaStore, savePreRestoreCopy, validateBackup } from '../../storage.js';
+import { downloadBackup } from '../actions.js';
 import { formatDateTime, zonedDateKey } from '../../time.js';
 
 // Filters survive navigation within the session.
@@ -14,12 +15,12 @@ export function filterExperiments(records, f, nowMs) {
   const q = f.q.trim().toLowerCase();
   return records
     .filter((r) => {
-      if (q && ![r.experimentId, r.name, r.batchId, r.notes, r.conditions].some((s) => String(s ?? '').toLowerCase().includes(q))) return false;
+      if (q && ![r.experimentId, displayName(r), r.batchId, r.notes, r.conditions].some((s) => String(s ?? '').toLowerCase().includes(q))) return false;
       if (f.status === 'overdue') {
         if (!isOverdue(r, nowMs)) return false;
       } else if (f.status !== 'all' && effectiveStatus(r, nowMs) !== f.status) return false;
       if (f.batch && r.batchId !== f.batch) return false;
-      const day = zonedDateKey(Date.parse(r.targetAt), r.timeZone);
+      const day = zonedDateKey(windowOf(r)?.startMs ?? Date.parse(r.targetAt), r.timeZone);
       if (f.from && day < f.from) return false;
       if (f.to && day > f.to) return false;
       return true;
@@ -36,19 +37,20 @@ export function renderHistory(container, ctx) {
     html`<div class="page-head">
       <h1>History</h1>
       <div class="action-bar">
-        <button type="button" class="btn btn-secondary" data-export-csv>Export CSV</button>
+        <button type="button" class="btn btn-secondary" data-export-csv>Export batches CSV</button>
+        <button type="button" class="btn btn-secondary" data-export-obs>Export observations CSV</button>
       </div>
     </div>
     <form class="card filters" role="search" aria-label="Filter experiments">
       <div class="field grow">
         <label for="h-q">Search</label>
-        <input id="h-q" name="q" type="search" value="${filters.q}" placeholder="ID, name, batch, notes…">
+        <input id="h-q" name="q" type="search" value="${filters.q}" placeholder="Batch name, record ID, notes…">
       </div>
       <div class="field">
         <label for="h-status">Status</label>
         <select id="h-status" name="status">
           ${['all', 'planned', 'active', 'overdue', 'completed', 'cancelled'].map(
-            (s) => html`<option value="${s}" ${filters.status === s ? 'selected' : ''}>${s === 'all' ? 'All' : s === 'overdue' ? 'Overdue' : STATUS_LABEL[s]}</option>`
+            (s) => html`<option value="${s}" ${filters.status === s ? 'selected' : ''}>${s === 'all' ? 'All' : s === 'overdue' ? 'Overdue or window passed' : STATUS_LABEL[s]}</option>`
           )}
         </select>
       </div>
@@ -75,13 +77,17 @@ export function renderHistory(container, ctx) {
     <div id="h-totals"></div>
     <div id="h-results"></div>
 
-    <section class="card backup">
-      <h2>Data and backup</h2>
-      <p>Records are stored only in this browser on this device. They are not synced to other devices or shared with other researchers, and clearing browser data deletes them. Download a backup regularly.</p>
+    <section class="card backup" aria-labelledby="h-backup">
+      <h2 id="h-backup">Data and backup</h2>
+      <p>Records are stored only in this browser on this device. They are not synced to other devices or shared with other researchers, and clearing browser data deletes them.</p>
+      <div id="backup-status"></div>
       <div class="action-bar">
         <button type="button" class="btn btn-secondary" data-export-json>Download backup (JSON)</button>
         <label class="btn btn-ghost file-btn">Restore from backup… <input type="file" accept="application/json,.json" data-import-json class="sr-only"></label>
       </div>
+      <p class="hint">A restore checks the whole file first and changes nothing if any problem is found. Before restoring, a copy of the current data is kept in this browser.</p>
+      <div id="restore-result" aria-live="polite"></div>
+      <p class="hint">The observations CSV has one row per observation, including retracted ones (marked “retracted” with the time and reason). Estimated stages appear only in “Estimated stage (estimate)” columns.</p>
     </section>`
   );
 
@@ -103,16 +109,20 @@ export function renderHistory(container, ctx) {
       return;
     }
     results.innerHTML = String(html`<div class="table-wrap"><table class="table">
-      <thead><tr><th scope="col">Experiment</th><th scope="col">Batch</th><th scope="col">Eggs</th><th scope="col">Status</th><th scope="col">Target</th><th scope="col">Remaining / outcome</th></tr></thead>
+      <thead><tr><th scope="col">Batch</th><th scope="col">Sample</th><th scope="col">Eggs</th><th scope="col">Status</th><th scope="col">Target / estimated window</th><th scope="col">Remaining / outcome</th></tr></thead>
       <tbody>${shown.map(
         (r) => html`<tr>
-          <td data-label="Experiment"><div><a class="mono" href="#/exp/${r.uid}">${r.experimentId}</a><div class="muted small">${r.name}</div></div></td>
-          <td data-label="Batch">${r.batchId || '—'}</td>
+          <td data-label="Batch"><div><a href="#/exp/${r.uid}"><strong>${displayName(r)}</strong></a><div class="muted small mono">${r.experimentId}</div></div></td>
+          <td data-label="Sample">${r.batchId || '—'}</td>
           <td data-label="Eggs">${eggSummary(r)}</td>
           <td data-label="Status"><div class="badges">${statusBadge(r, now)}</div></td>
-          <td data-label="Target">${formatDateTime(Date.parse(r.targetAt), r.timeZone)}</td>
+          <td data-label="Target / window">${windowOf(r)
+            ? html`<span class="est-tag">estimate</span> ${formatWindow(windowOf(r), r.timeZone)}`
+            : formatDateTime(Date.parse(r.targetAt), r.timeZone)}</td>
           <td data-label="Remaining / outcome">${r.status === 'completed'
-            ? `Done, ${describeDelta(Date.parse(r.completedAt) - Date.parse(r.targetAt))}`
+            ? windowOf(r)
+              ? `Done ${Date.parse(r.completedAt) < windowOf(r).startMs ? 'before' : Date.parse(r.completedAt) > windowOf(r).endMs ? 'after' : 'inside'} the window`
+              : `Done, ${describeDelta(Date.parse(r.completedAt) - Date.parse(r.targetAt))}`
             : countdown(r, now)}</td>
         </tr>`
       )}</tbody></table></div>`);
@@ -137,34 +147,69 @@ export function renderHistory(container, ctx) {
     }
     const stamp = new Date(ctx.now()).toISOString().slice(0, 10);
     downloadFile(`embryotime-experiments-${stamp}.csv`, experimentsToCsv(shown, ctx.now()), 'text/csv;charset=utf-8');
-    toast(`Exported ${shown.length} experiment${shown.length === 1 ? '' : 's'} to CSV.`);
+    toast(`Exported ${shown.length} batch${shown.length === 1 ? '' : 'es'} to CSV.`);
   });
 
-  root.querySelector('[data-export-json]').addEventListener('click', () => {
+  root.querySelector('[data-export-obs]').addEventListener('click', () => {
+    const n = shown.reduce((k, r) => k + (r.observations?.length ?? 0), 0);
+    if (!n) {
+      toast('No observations in the batches shown.', 'warn');
+      return;
+    }
     const stamp = new Date(ctx.now()).toISOString().slice(0, 10);
-    const payload = JSON.stringify({ app: 'EmbryoTime', exportedAt: new Date(ctx.now()).toISOString(), experiments: ctx.experiments }, null, 2);
-    downloadFile(`embryotime-backup-${stamp}.json`, payload, 'application/json');
+    downloadFile(`embryotime-observations-${stamp}.csv`, observationsToCsv(shown), 'text/csv;charset=utf-8');
+    toast(`Exported ${n} observation${n === 1 ? '' : 's'} (retracted ones included and marked).`);
   });
+
+  const backupMeta = createBackupMetaStore();
+  const renderBackupStatus = () => {
+    root.querySelector('#backup-status').innerHTML = String(backupStatusPanel(ctx, { withButton: false }));
+  };
+
+  root.querySelector('[data-export-json]').addEventListener('click', () => downloadBackup(ctx, renderBackupStatus));
 
   root.querySelector('[data-import-json]').addEventListener('change', async (e) => {
     const file = e.target.files?.[0];
     e.target.value = '';
     if (!file) return;
+    const out = root.querySelector('#restore-result');
+    let data;
     try {
-      const imported = validateImportedRecords(JSON.parse(await file.text()));
-      const byUid = new Map(ctx.experiments.map((r) => [r.uid, r]));
-      const replacing = imported.filter((r) => byUid.has(r.uid)).length;
-      const msg = `Restore ${imported.length} experiment(s) from "${file.name}"?${replacing ? ` ${replacing} existing record(s) with the same internal ID will be replaced.` : ''}`;
-      if (!window.confirm(msg)) return;
-      for (const r of imported) byUid.set(r.uid, r);
+      data = JSON.parse(await file.text());
+    } catch {
+      out.innerHTML = String(html`<div class="alert alert-error" role="alert"><strong>Not restored.</strong> “${file.name}” is not valid JSON. Nothing was changed.</div>`);
+      return;
+    }
+    const v = validateBackup(data, { existing: ctx.experiments });
+    if (!v.ok) {
+      out.innerHTML = String(html`<div class="alert alert-error" role="alert"><strong>Not restored — nothing was changed.</strong> “${file.name}” has ${v.errors.length === 1 ? 'a problem' : 'problems'}:
+        <ul>${v.errors.map((e) => html`<li>${e}</li>`)}</ul></div>`);
+      return;
+    }
+    const byUid = new Map(ctx.experiments.map((r) => [r.uid, r]));
+    const replacing = v.records.filter((r) => byUid.has(r.uid)).length;
+    const obs = v.records.reduce((k, r) => k + r.observations.length, 0);
+    const msg = `Restore ${v.records.length} batch(es) with ${obs} observation(s) from "${file.name}" (format ${v.format})?${
+      replacing ? ` ${replacing} batch(es) already in this browser will be replaced by the file's version.` : ''
+    } A copy of your current data is kept first.`;
+    if (!window.confirm(msg)) return;
+    try {
+      const key = savePreRestoreCopy(ctx.experiments, ctx.now());
+      for (const r of v.records) byUid.set(r.uid, r);
       await ctx.replaceAll([...byUid.values()]);
-      toast(`Restored ${imported.length} experiment(s).`);
+      toast(`Restored ${v.records.length} batch(es).`);
       ctx.rerender();
+      document.querySelector('#restore-result')?.insertAdjacentHTML(
+        'beforeend',
+        String(html`<div class="alert alert-info">Restored ${v.records.length} batch(es). Your previous data was copied to browser storage key <code>${key}</code>.</div>`)
+      );
     } catch (err) {
-      toast(err instanceof SyntaxError ? 'That file is not valid JSON.' : err.message, 'error');
+      out.innerHTML = String(html`<div class="alert alert-error" role="alert"><strong>Restore failed:</strong> ${err.message}. Your data was not replaced.</div>`);
     }
   });
 
   renderResults();
+  renderBackupStatus();
+  void backupMeta;
   return { tickRerender: false, onFlip: renderResults };
 }

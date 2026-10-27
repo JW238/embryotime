@@ -11,7 +11,7 @@ export function buildDemoExperiments(nowMs, timeZone) {
     { id: 'DEMO-004', name: '[DEMO] Planned placement tomorrow', batch: 'DEMO-B2', eggs: 40, cur: 0, wait: 48, placedHoursAgo: -20 },
     { id: 'DEMO-005', name: '[DEMO] Completed example', batch: 'DEMO-B3', eggs: 36, cur: 60, wait: 24, placedHoursAgo: 30, completeLateMin: 12 },
   ];
-  return specs.map((s) => {
+  const records = specs.map((s) => {
     const placement = instantToWallInputs(nowMs - s.placedHoursAgo * MS_PER_HOUR, timeZone);
     const v = validateExperimentInput(
       {
@@ -40,4 +40,26 @@ export function buildDemoExperiments(nowMs, timeZone) {
     }
     return record;
   });
+  // A stage-based example: freshly set eggs → HH19, tracked as an estimated window.
+  const placed = instantToWallInputs(nowMs - 30 * MS_PER_HOUR, timeZone);
+  const v = validateExperimentInput(
+    {
+      experimentId: 'DEMO-006',
+      name: '[DEMO] Stage-based window (fresh eggs → HH19)',
+      nameIsDefault: false,
+      eggCount: '24',
+      timingMode: 'stage',
+      start: 'fresh',
+      targetStage: 19,
+      plannedReturn: 'none',
+      placementDate: placed.date,
+      placementTime: placed.time,
+      timeZone,
+      reminderOffsets: [],
+      notes: 'Demo data — not a real experiment.',
+    },
+    { nowMs }
+  );
+  if (!v.ok) throw new Error(`Demo record DEMO-006 is invalid: ${JSON.stringify(v.errors)}`);
+  return [...records, createExperiment(v.value, { nowMs: nowMs - 30 * MS_PER_HOUR, demo: true })];
 }

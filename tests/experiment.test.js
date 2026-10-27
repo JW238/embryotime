@@ -83,10 +83,13 @@ test('duplicate experiment ID is rejected', () => {
   assert.match(v.errors.experimentId, /already used/);
 });
 
-test('warnings for missing reminders and batch ID, and a past target', () => {
+test('reminders and batch ID are optional (no warnings); a past target still warns', () => {
+  // Calendar alerts are opt-in and the Batch/sample ID field was removed from the form,
+  // so neither produces a warning any more. A past target still does.
   const v = validateExperimentInput({ ...baseInput, batchId: '', reminderOffsets: [], placementDate: '2026-10-20' }, { nowMs: NOW });
   assert.ok(v.ok);
-  assert.equal(v.warnings.length, 3);
+  assert.equal(v.warnings.length, 1);
+  assert.match(v.warnings[0], /already in the past/);
 });
 
 test('ambiguous placement uses the chosen occurrence', () => {

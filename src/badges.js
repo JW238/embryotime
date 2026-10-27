@@ -8,8 +8,9 @@
 //     (Counting "unable to confirm" means badges never reward guessing a stage.)
 //  3. Accidental duplicates (same batch, same minute, same answer and stage) count once.
 //  4. Demo batches do not count.
+//  5. Retracted observations do not count.
 
-import { observationKey } from './experiment.js';
+import { activeObservations, observationKey } from './experiment.js';
 
 /** Edit thresholds, titles and texts here. */
 export const BADGES = [
@@ -24,6 +25,7 @@ export const COUNTING_RULES = [
   'Every answer counts the same: matches, different, or unable to confirm.',
   'Accidental duplicates (same batch, same minute, same answer and stage) count once.',
   'Demo batches do not count.',
+  'Retracted observations do not count.',
 ];
 
 /** Number of observations that count toward badges, under the rules above. */
@@ -32,7 +34,7 @@ export function countObservations(records) {
   for (const r of records) {
     if (r.demo) continue;
     const seen = new Set();
-    for (const o of r.observations ?? []) {
+    for (const o of activeObservations(r)) {
       if (!o || Number.isNaN(Date.parse(o.observedAt))) continue;
       const key = observationKey(o);
       if (seen.has(key)) continue;

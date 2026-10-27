@@ -1,4 +1,4 @@
-// Estimated vs observed HH stage over calculated incubation age.
+// Estimated vs observed HH stage over time since placement.
 //
 // Integrity rules: the reference band is labelled as an estimate; each observation also shows
 // the estimate that was stored with it; observed stages are separate markers (shape-coded,
@@ -6,19 +6,19 @@
 // confirm" sits in its own lane with no stage; periods without observations stay empty.
 
 import { esc } from './dom.js';
-import { VERDICTS, observationsByTime } from '../experiment.js';
-import { estimateStage } from '../hh-stages.js';
+import { VERDICTS, baselineAgeMinutes, formatAgeRange, isRetracted, observationsByTime, windowOf } from '../experiment.js';
+import { estimateStageForRange } from '../hh-stages.js';
 import { formatDateTime, formatDuration } from '../time.js';
 
 const CONFLICT_WINDOW_MIN = 60;
 
 /** Pairs of staged observations within an hour of each other that record different stages. */
 export function findConflicts(record) {
-  const staged = observationsByTime(record).filter((o) => o.observedStage !== null);
+  const staged = observationsByTime(record).filter((o) => o.observedStage !== null && !isRetracted(record, o.id));
   const out = [];
   for (let i = 0; i < staged.length; i++) {
     for (let j = i + 1; j < staged.length; j++) {
-      const gap = Math.abs(staged[j].ageMinutes - staged[i].ageMinutes);
+      const gap = Math.abs(Date.parse(staged[j].observedAt) - Date.parse(staged[i].observedAt)) / 60_000;
       if (gap <= CONFLICT_WINDOW_MIN && staged[i].observedStage !== staged[j].observedStage) out.push([staged[i], staged[j]]);
     }
   }
@@ -38,29 +38,39 @@ function ageTickLabel(h, useDays) {
 export function observationTip(o, tz) {
   const what =
     o.verdict === VERDICTS.UNCONFIRMED
-      ? 'Stage not confirmed'
-      : `Observed HH${o.observedStage} (${o.verdict === VERDICTS.MATCH ? 'matches' : 'differs from'} estimate ${o.estimate.label})`;
-  return `${what} · ${formatDuration(o.ageMinutes)} incubation · ${formatDateTime(Date.parse(o.observedAt), tz)}${o.note ? ` · Note: ${o.note}` : ''}`;
+      ? `Stage not confirmed (estimate ${o.estimate.label})`
+      : o.verdict === VERDICTS.BASELINE
+        ? `Observed HH${o.observedStage} at setup`
+        : `Observed HH${o.observedStage} (${o.verdict === VERDICTS.MATCH ? 'matches' : 'differs from'} estimate ${o.estimate.label})`;
+  const age = formatAgeRange(o.ageRangeMinutes ?? [o.ageMinutes, o.ageMinutes]);
+  return `${what} · ${age} calculated incubation · ${formatDateTime(Date.parse(o.observedAt), tz)}${o.note ? ` · Note: ${o.note}` : ''}`;
 }
+
+const elapsedH = (record, o) => Math.max(0, (Date.parse(o.observedAt) - Date.parse(record.placementAt)) / 3_600_000);
 
 /** Returns SVG markup sized to `width` px. */
 export function stageChartSvg(record, { width, nowMs, open }) {
-  const obs = observationsByTime(record);
-  const placementAge = record.currentIncubationMinutes / 60;
-  const targetAge = (record.currentIncubationMinutes + record.waitMinutes) / 60;
-  const nowAge = open ? (record.currentIncubationMinutes + Math.max(0, (nowMs - Date.parse(record.placementAt)) / 60_000)) / 60 : null;
-  const obsAges = obs.map((o) => o.ageMinutes / 60);
-  let x0 = Math.min(placementAge, ...obsAges);
-  let x1 = Math.max(targetAge, ...obsAges);
-  const pad = Math.max(1, (x1 - x0) * 0.04);
-  x0 = Math.max(0, x0 - pad);
+  // x = hours since placement (exact); the stage band carries the starting-age uncertainty.
+  const obs = observationsByTime(record).filter((o) => !isRetracted(record, o.id));
+  const placement = Date.parse(record.placementAt);
+  const w = windowOf(record);
+  const targetX = w ? null : (Date.parse(record.targetAt) - placement) / 3_600_000;
+  const winX = w ? [(w.startMs - placement) / 3_600_000, (w.endMs - placement) / 3_600_000] : null;
+  const nowX = open ? Math.max(0, (nowMs - placement) / 3_600_000) : null;
+  const obsX = obs.map((o) => elapsedH(record, o));
+  let x0 = 0;
+  let x1 = Math.max(winX ? winX[1] : targetX, ...obsX, 1);
+  const pad = Math.max(0.5, (x1 - x0) * 0.04);
   x1 += pad;
+  x0 = -Math.min(pad, 0.5);
+  const [b0, b1] = baselineAgeMinutes(record);
 
   // Reference band sampled from the table (current reference version).
   const N = 240;
   const samples = Array.from({ length: N + 1 }, (_, i) => {
     const h = x0 + ((x1 - x0) * i) / N;
-    return { h, stages: estimateStage(h * 60).stages };
+    const e = Math.max(0, h) * 60;
+    return { h, stages: estimateStageForRange(b0 + e, b1 + e).stages };
   });
   const stageVals = [
     ...samples.flatMap((s) => s.stages),
@@ -91,7 +101,10 @@ export function stageChartSvg(record, { width, nowMs, open }) {
     parts.push(`<line class="sc-tickline" x1="${X(h)}" x2="${X(h)}" y1="${plotB + 6 + laneH}" y2="${plotB + 10 + laneH}"/>`);
     parts.push(`<text class="sc-tick" x="${X(h)}" y="${plotB + laneH + 22}" text-anchor="middle">${ageTickLabel(h, useDays)}</text>`);
   }
-  parts.push(`<text class="sc-axis" x="${(m.l + width - m.r) / 2}" y="${H - 6}" text-anchor="middle">Calculated incubation age</text>`);
+  parts.push(`<text class="sc-axis" x="${(m.l + width - m.r) / 2}" y="${H - 6}" text-anchor="middle">Time since placement</text>`);
+  if (winX) {
+    parts.push(`<rect class="sc-window" x="${X(winX[0])}" y="${m.t}" width="${Math.max(2, X(winX[1]) - X(winX[0]))}" height="${plotB - m.t}"/>`);
+  }
 
   // reference band (stepped; no smoothing)
   const top = [];
@@ -118,12 +131,13 @@ export function stageChartSvg(record, { width, nowMs, open }) {
             : `<text class="sc-ref-label" x="${X(h) + 4}" y="${m.t + 10}">${label}</text>`
         }`
       : '';
-  parts.push(vline(targetAge, 'Target', 'sc-target'));
-  if (nowAge !== null) parts.push(vline(nowAge, 'Now', 'sc-now'));
+  if (targetX !== null) parts.push(vline(targetX, 'Target', 'sc-target'));
+  if (winX) parts.push(vline(winX[0], 'Window', 'sc-target'));
+  if (nowX !== null) parts.push(vline(nowX, 'Now', 'sc-now'));
 
   // observations: stored estimate bracket + observed marker (no connecting lines)
   for (const o of obs) {
-    const x = X(o.ageMinutes / 60);
+    const x = X(elapsedH(record, o));
     const [lo, hi] = o.estimate.stages;
     const tip = esc(observationTip(o, record.timeZone));
     parts.push(`<g class="sc-snap"><line x1="${x}" x2="${x}" y1="${Y(hi + 0.4)}" y2="${Y(lo - 0.4)}"/>
@@ -131,6 +145,7 @@ export function stageChartSvg(record, { width, nowMs, open }) {
     let mark;
     if (o.verdict === VERDICTS.UNCONFIRMED) mark = `<circle class="sc-unconfirmed" cx="${x}" cy="${laneY}" r="6"/>`;
     else if (o.verdict === VERDICTS.MATCH) mark = `<circle class="sc-obs" cx="${x}" cy="${Y(o.observedStage)}" r="6.5"/>`;
+    else if (o.verdict === VERDICTS.BASELINE) mark = `<rect class="sc-obs" x="${x - 6}" y="${Y(o.observedStage) - 6}" width="12" height="12"/>`;
     else {
       const y = Y(o.observedStage);
       mark = `<path class="sc-obs" d="M${x} ${y - 8}L${x + 8} ${y}L${x} ${y + 8}L${x - 8} ${y}Z"/>`;
@@ -141,7 +156,7 @@ export function stageChartSvg(record, { width, nowMs, open }) {
   }
 
   return `<svg class="stage-chart-svg" width="${width}" height="${H}" viewBox="0 0 ${width} ${H}" role="group"
-    aria-label="HH stage estimate band and ${obs.length} recorded observation${obs.length === 1 ? '' : 's'} by incubation age">${parts.join('')}</svg>`;
+    aria-label="Chart: estimated HH stage band and ${obs.length} active observation${obs.length === 1 ? '' : 's'} by time since placement. The table below lists every observation.">${parts.join('')}</svg>`;
 }
 
 /** Render into a container, re-render on resize, and add hover/focus tooltips. */

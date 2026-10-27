@@ -1,10 +1,10 @@
 // Home screen: the researcher's coop with one egg per open experiment.
 
 import { html, mount, toast } from '../dom.js';
-import { countdown } from '../components.js';
+import { backupStatusPanel, countdown } from '../components.js';
 import { chickArt, eggArt, flowerArt, henArt, hillsArt, nestArt } from '../art.js';
-import { bindActions, loadDemoData, openDialog, removeDemoData } from '../actions.js';
-import { DEFAULT_COOP_ID, batchTotals, eggCounts, formatEggs } from '../../experiment.js';
+import { bindActions, downloadBackup, loadDemoData, openDialog, removeDemoData } from '../actions.js';
+import { DEFAULT_COOP_ID, batchTotals, displayName, eggCounts, formatEggs, windowOf } from '../../experiment.js';
 import { STAGE_LABEL, coopEggs, eggProgress, eggStage, greeting, henMessage, recentlyHatched, shellVariant } from '../../hatchery.js';
 import { coopDisplayName } from '../../storage.js';
 import { badgeArt } from '../art.js';
@@ -12,7 +12,9 @@ import { BADGES, badgeProgress, countObservations } from '../../badges.js';
 import { formatDate, formatDateTime, formatTime, zoneAbbreviation } from '../../time.js';
 
 // Text glyph per stage, so stages differ by shape and words, not only colour.
-const STAGE_ICON = { planned: '◷', warming: '♨', almost: '◔', due: '!', hatched: '✓', cancelled: '×' };
+const STAGE_ICON = { planned: '◷', warming: '♨', almost: '◔', window: '◔', due: '!', passed: '!', hatched: '✓', cancelled: '×' };
+// Window stages reuse the existing egg artwork.
+const ART_STAGE = { window: 'almost', passed: 'due' };
 
 // Which batch's egg grid is open; survives re-renders while the page is open.
 let openUid = null;
@@ -26,36 +28,47 @@ function eggCountLine(r) {
 
 function batchSlot(r, now, isNew) {
   const stage = eggStage(r, now);
-  const t = Date.parse(r.targetAt);
+  const w = windowOf(r);
+  const t = w ? w.startMs : Date.parse(r.targetAt);
   const pct = Math.round(eggProgress(r, now) * 100);
-  const when = `${formatDate(t, r.timeZone)} ${formatTime(t, r.timeZone)} ${zoneAbbreviation(t, r.timeZone)}`;
+  const when = w
+    ? `estimated window ${formatDate(w.startMs, r.timeZone)} ${formatTime(w.startMs, r.timeZone)} to ${formatDate(w.endMs, r.timeZone)} ${formatTime(w.endMs, r.timeZone)} ${zoneAbbreviation(w.endMs, r.timeZone)}`
+    : `target ${formatDate(t, r.timeZone)} ${formatTime(t, r.timeZone)} ${zoneAbbreviation(t, r.timeZone)}`;
   const c = eggCounts(r);
+  const art = ART_STAGE[stage] ?? stage;
   const v = shellVariant(r.uid);
   const open = openUid === r.uid;
   return html`<li class="nest-slot stage-${stage} ${isNew ? 'is-new' : ''} ${open ? 'is-open' : ''}" style="--i:${v}" data-slot="${r.uid}">
     <button type="button" class="egg-link clutch-toggle" data-toggle-clutch="${r.uid}" aria-expanded="${String(open)}" aria-controls="clutch-${r.uid}"
-      aria-label="Show the eggs in ${r.experimentId}">
+      aria-label="Show the eggs in ${displayName(r)}">
       <span class="egg-art clutch">
-        <span class="egg-wrap clutch-back clutch-l">${eggArt({ stage, variant: (v + 1) % 3 })}</span>
-        <span class="egg-wrap clutch-back clutch-r">${eggArt({ stage, variant: (v + 2) % 3 })}</span>
-        <span class="egg-wrap clutch-front">${eggArt({ stage, variant: v })}</span>
+        <span class="egg-wrap clutch-back clutch-l">${eggArt({ stage: art, variant: (v + 1) % 3 })}</span>
+        <span class="egg-wrap clutch-back clutch-r">${eggArt({ stage: art, variant: (v + 2) % 3 })}</span>
+        <span class="egg-wrap clutch-front">${eggArt({ stage: art, variant: v })}</span>
         ${nestArt()}
         <span class="clutch-count" aria-hidden="true">×${c.known ? c.active : '?'}</span>
       </span>
     </button>
     <div class="egg-tag">
       <div class="egg-tag-head">
-        <a class="egg-id" href="#/exp/${r.uid}" aria-label="${r.experimentId}: ${STAGE_LABEL[stage]}, ${c.known ? `${c.active} eggs` : 'egg count not recorded'}, target ${when}. Open details">${r.experimentId}</a>
+        <a class="egg-id egg-title" href="#/exp/${r.uid}" aria-label="${displayName(r)}: ${STAGE_LABEL[stage]}, ${c.known ? `${c.active} eggs` : 'egg count not recorded'}, ${when}. Open details">${displayName(r)}</a>
         <span class="stage-pill"><span aria-hidden="true">${STAGE_ICON[stage]}</span> ${STAGE_LABEL[stage]}</span>
       </div>
-      <p class="egg-name">${r.name}${r.batchId ? html` · ${r.batchId}` : ''}${r.demo ? html` <span class="badge badge-demo">Demo</span>` : ''}</p>
+      <p class="egg-name"><span class="record-id">${r.experimentId}</span>${r.batchId ? html` · ${r.batchId}` : ''}${r.demo ? html` <span class="badge badge-demo">Demo</span>` : ''}</p>
       ${eggCountLine(r)}
-      <div class="egg-when">
-        <span class="egg-date">${formatDate(t, r.timeZone)}</span>
-        <span class="egg-time">${formatTime(t, r.timeZone)} <small>${zoneAbbreviation(t, r.timeZone)}</small></span>
-      </div>
+      ${w
+        ? html`<div class="egg-when">
+            <span class="egg-date"><span class="est-tag">estimate</span> HH${r.stagePlan.targetStage} window · ${formatDate(w.startMs, r.timeZone)}</span>
+            <span class="egg-time egg-window">${formatTime(w.startMs, r.timeZone)}–${formatTime(w.endMs, r.timeZone)}${
+              formatDate(w.startMs, r.timeZone) !== formatDate(w.endMs, r.timeZone) ? html` <small>(+${Math.round((w.endMs - w.startMs) / 86_400_000) || 1}d)</small>` : ''
+            } <small>${zoneAbbreviation(w.endMs, r.timeZone)}</small></span>
+          </div>`
+        : html`<div class="egg-when">
+            <span class="egg-date">${formatDate(t, r.timeZone)}</span>
+            <span class="egg-time">${formatTime(t, r.timeZone)} <small>${zoneAbbreviation(t, r.timeZone)}</small></span>
+          </div>`}
       ${countdown(r, now)}
-      <div class="progress" role="progressbar" aria-label="Waiting period elapsed" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${pct}"
+      <div class="progress" role="progressbar" aria-label="${w ? 'Time until the estimated window opens' : 'Waiting period elapsed'}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${pct}"
         data-progress-start="${Date.parse(r.placementAt)}" data-progress-end="${t}">
         <span style="width:${pct}%"></span>
       </div>
@@ -75,9 +88,9 @@ function clutchPanel(r, now) {
         ...Array.from({ length: c.removed }, (_, i) => html`<li class="mini mini-removed" style="--k:${c.active + c.completed + i}"><span>×</span></li>`),
       ]
     : [];
-  return html`<li class="clutch-panel stage-${stage}" id="clutch-${r.uid}" aria-label="Eggs in ${r.experimentId}">
+  return html`<li class="clutch-panel stage-${stage}" id="clutch-${r.uid}" aria-label="Eggs in ${displayName(r)}">
     <div class="clutch-head">
-      <h3><span class="mono">${r.experimentId}</span> <span class="muted">· ${r.name}</span></h3>
+      <h3>${displayName(r)} <span class="muted mono small">· ${r.experimentId}</span></h3>
       <button type="button" class="btn btn-ghost btn-sm" data-toggle-clutch="${r.uid}" aria-label="Close egg view">Close ✕</button>
     </div>
     ${c.known
@@ -88,7 +101,9 @@ function clutchPanel(r, now) {
             <span class="muted">· ${c.initial} placed</span>
           </p>
           <ul class="egg-grid" aria-hidden="true">${cells}</ul>
-          <p class="hint">All eggs share this batch's schedule: target ${formatDateTime(t, r.timeZone)}${stage === 'due' ? ' — now overdue' : ''}.
+          <p class="hint">All eggs share this batch's schedule: ${windowOf(r)
+            ? `estimated window ${formatDateTime(windowOf(r).startMs, r.timeZone)} – ${formatDateTime(windowOf(r).endMs, r.timeZone)}${stage === 'passed' ? ' — window passed' : ''}`
+            : `target ${formatDateTime(t, r.timeZone)}${stage === 'due' ? ' — now overdue' : ''}`}.
             Eggs are counted, not tracked one by one, so positions in the grid are illustrative.</p>
           <div class="clutch-actions">
             <button type="button" class="btn btn-primary btn-sm" data-action="observe" data-uid="${r.uid}">Record observation…</button>
@@ -179,13 +194,14 @@ export function renderHatchery(container, ctx, { laid } = {}) {
             <h2 id="h-hatched">Recently completed <span class="muted small">(last 7 days)</span></h2>
             <ul class="chicks">${hatched.map(
               (r) => html`<li><a href="#/exp/${r.uid}"><span class="chick-wrap">${chickArt()}</span>
-                <span class="mono">${r.experimentId}</span>
+                <span>${displayName(r)}</span>
                 ${eggCounts(r).known ? html`<span class="small">${formatEggs(eggCounts(r).completed)}</span>` : ''}
                 <span class="muted small">${formatDateTime(Date.parse(r.completedAt), r.timeZone)}</span></a></li>`
             )}</ul>
           </section>`
         : ''}
 
+      <div id="hatchery-backup">${backupStatusPanel(ctx, { compact: true })}</div>
       ${collectionTeaser(all)}
 
       ${hasDemo
@@ -200,6 +216,7 @@ export function renderHatchery(container, ctx, { laid } = {}) {
   root.querySelector('[data-load-demo]')?.addEventListener('click', () => loadDemoData(ctx));
   root.querySelector('[data-remove-demo]')?.addEventListener('click', () => removeDemoData(ctx));
   root.querySelector('[data-rename]').addEventListener('click', () => openRenameDialog(ctx));
+  root.querySelector('[data-backup-now]')?.addEventListener('click', () => downloadBackup(ctx, () => ctx.rerender()));
   bindActions(root, ctx);
   root.addEventListener('click', (e) => {
     const toggle = e.target.closest('[data-toggle-clutch]');

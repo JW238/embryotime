@@ -99,39 +99,57 @@ const firstListed = listed[0];
 const lastListedMax = Math.max(...listed.map((s) => s.maxHours));
 
 /**
- * Estimated stage range for an incubation age, using only the reference table:
- *  - 'within': stages whose listed age range contains the age (ranges overlap, so often several);
- *  - 'between': the age falls in a gap between listed ages → the two neighbouring stages;
+ * Estimated stage range for an incubation-age interval [loMinutes, hiMinutes], using only the
+ * reference table. An exact age is the special case lo === hi.
+ *  - 'within': listed stages whose age range intersects the interval (ranges overlap, so often several);
+ *  - 'between': the interval lies entirely in a gap between listed ages → the two neighbouring stages;
  *  - 'before-first': younger than the first listed age (HH1 has none) → HH1–HH2;
  *  - 'beyond': older than the last listed age → HH46, flagged as beyond the table.
+ * Intervals that cross several of these regions combine them (e.g. HH1–HH3).
  * Returns a plain snapshot object safe to store with an observation.
  */
+export function estimateStageForRange(loMinutes, hiMinutes) {
+  if (![loMinutes, hiMinutes].every(Number.isFinite) || loMinutes < 0 || hiMinutes < loMinutes) {
+    throw new RangeError('Incubation age range must be non-negative numbers with lo ≤ hi');
+  }
+  const lo = loMinutes / 60;
+  const hi = hiMinutes / 60;
+  const set = new Set();
+  let method = 'within';
+  if (lo < firstListed.minHours) {
+    set.add(HH_MIN);
+    set.add(firstListed.stage);
+    if (hi < firstListed.minHours) method = 'before-first';
+  }
+  for (const s of listed) if (s.minHours <= hi && lo <= s.maxHours) set.add(s.stage);
+  const beyond = hi > lastListedMax;
+  if (beyond) set.add(HH_MAX);
+  if (lo > lastListedMax) method = 'beyond';
+  if (set.size === 0) {
+    set.add(Math.max(...listed.filter((s) => s.maxHours < lo).map((s) => s.stage)));
+    set.add(Math.min(...listed.filter((s) => s.minHours > hi).map((s) => s.stage)));
+    method = 'between';
+  }
+  const stages = [Math.min(...set), Math.max(...set)];
+  const label =
+    method === 'beyond'
+      ? `HH${HH_MAX} or later (beyond the reference ages)`
+      : `${stageRangeLabel(stages)}${beyond ? ' or later' : ''}`;
+  const exact = loMinutes === hiMinutes;
+  return {
+    stages,
+    label,
+    method,
+    ageRangeMinutes: [Math.round(loMinutes), Math.round(hiMinutes)],
+    ageMinutes: exact ? Math.round(loMinutes) : null,
+    referenceVersion: HH_REFERENCE.version,
+  };
+}
+
+/** Estimate for a single, exactly known incubation age. */
 export function estimateStage(ageMinutes) {
   if (!Number.isFinite(ageMinutes) || ageMinutes < 0) throw new RangeError('Incubation age must be a non-negative number');
-  const h = ageMinutes / 60;
-  let stages;
-  let method;
-  if (h < firstListed.minHours) {
-    stages = [HH_MIN, firstListed.stage];
-    method = 'before-first';
-  } else if (h > lastListedMax) {
-    stages = [HH_MAX, HH_MAX];
-    method = 'beyond';
-  } else {
-    const hits = listed.filter((s) => s.minHours <= h && h <= s.maxHours).map((s) => s.stage);
-    if (hits.length) {
-      stages = [Math.min(...hits), Math.max(...hits)];
-      method = 'within';
-    } else {
-      const lower = Math.max(...listed.filter((s) => s.maxHours < h).map((s) => s.stage));
-      const upper = Math.min(...listed.filter((s) => s.minHours > h).map((s) => s.stage));
-      stages = [lower, upper];
-      method = 'between';
-    }
-  }
-  const label =
-    method === 'beyond' ? `HH${HH_MAX} or later (beyond the reference ages)` : stageRangeLabel(stages);
-  return { stages, label, method, ageMinutes: Math.round(ageMinutes), referenceVersion: HH_REFERENCE.version };
+  return estimateStageForRange(ageMinutes, ageMinutes);
 }
 
 export const ESTIMATE_METHOD_TEXT = {
@@ -139,8 +157,130 @@ export const ESTIMATE_METHOD_TEXT = {
   between: 'This age falls between two listed reference ages.',
   'before-first': 'Younger than the first listed reference age (HH2, 6 h); HH1 has no listed age.',
   beyond: 'Older than the last listed reference age (21 d).',
+  range: 'All stages whose listed reference ages overlap the estimated age range.',
 };
 
 export function stageInRange(stage, [lo, hi]) {
   return stage >= lo && stage <= hi;
+}
+
+// ---------- stage-based planning ----------
+//
+// A plan starts from either freshly set eggs (incubation age exactly 0 h — a known elapsed time,
+// not an HH1 observation) or a current HH stage (age = that stage's listed reference range).
+// The target stage's listed range gives an estimated *window*, never a single exact time:
+//   window start = max(0, targetMin − baselineMax)      window end = targetMax − baselineMin
+// This interval arithmetic only combines the table's listed ranges; it does not capture the
+// full biological variation between embryos or incubation conditions.
+
+export const PLANNED_RETURN = Object.freeze({
+  none: 'No planned return — track the window only',
+  start: 'Start of window',
+  middle: 'Middle of window',
+  end: 'End of window',
+});
+
+export const PLANNED_RETURN_HELP = {
+  none: 'Countdowns and the calendar show the estimated window itself.',
+  start: 'Earliest return: less chance of missing an early target, but the stage may not have been reached yet.',
+  middle: 'A scheduling convention between the two extremes — not a scientifically proven optimum.',
+  end: 'Latest return: more development time, but a greater chance the target stage has already passed.',
+};
+
+export const PLAN_VERSION = 2;
+
+/**
+ * input: { start: 'fresh'|'stage', currentStage, targetStage, plannedReturn, observed }
+ * Returns { ok, plan } or { ok: false, code, field, error } — never an invented age.
+ */
+export function planStages({ start, currentStage, targetStage, plannedReturn, observed = false }) {
+  const fail = (code, field, error) => ({ ok: false, code, field, error });
+  if (start !== 'fresh' && start !== 'stage') return fail('start', 'start', 'Choose a starting point: freshly set eggs or a current HH stage.');
+  let baseline;
+  let basis;
+  let cur = null;
+  if (start === 'fresh') {
+    baseline = [0, 0];
+    basis = 'known-age';
+  } else {
+    if (currentStage === null || currentStage === undefined || currentStage === '') return fail('missing', 'current', 'Choose the current HH stage.');
+    if (!isValidStage(currentStage)) return fail('invalid', 'current', 'The current stage must be a whole number from 1 to 46.');
+    cur = getStage(currentStage);
+    if (cur.minHours === null) {
+      return fail(
+        'no-reference-age',
+        'current',
+        `HH${currentStage} has no reference age in the source table, so a waiting time cannot be calculated from it. For eggs that have just been set, choose “Freshly set eggs — incubation age 0 h”; otherwise choose HH2 or later.`
+      );
+    }
+    baseline = [cur.minHours, cur.maxHours];
+    basis = observed ? 'observed' : 'selected';
+  }
+  if (targetStage === null || targetStage === undefined || targetStage === '') return fail('missing', 'target', 'Choose the target HH stage.');
+  if (!isValidStage(targetStage)) return fail('invalid', 'target', 'The target stage must be a whole number from 1 to 46.');
+  if (cur && targetStage <= currentStage) return fail('order', 'target', `The target stage must be later than the current stage (HH${currentStage}).`);
+  const t = getStage(targetStage);
+  if (t.minHours === null) return fail('no-reference-age', 'target', `HH${targetStage} has no reference age in the source table. Choose HH2 or later as the target.`);
+  if (plannedReturn === undefined || plannedReturn === null || plannedReturn === '') {
+    return fail('missing', 'plannedReturn', 'Choose whether to plan a specific return time.');
+  }
+  if (!Object.hasOwn(PLANNED_RETURN, plannedReturn)) return fail('invalid', 'plannedReturn', 'Choose a valid planned-return option.');
+  return windowPlan({ baseline, basis, currentStage: cur ? currentStage : null, start, targetStage, plannedReturn });
+}
+
+/** Shared by new plans and conversions of older batches (exact baseline from entered durations). */
+export function windowPlan({ baseline, basis, currentStage = null, start, targetStage, plannedReturn }) {
+  const t = getStage(targetStage);
+  const rawStart = t.minHours - baseline[1];
+  const windowStart = Math.max(0, rawStart);
+  const windowEnd = t.maxHours - baseline[0];
+  if (windowEnd <= 0) {
+    return {
+      ok: false,
+      code: 'already-past',
+      field: 'target',
+      error: `The starting age (${formatHoursRange(baseline)}) is already at or past HH${targetStage}'s reference age (${formatHoursRange([t.minHours, t.maxHours])}). Choose a later target stage.`,
+    };
+  }
+  if (plannedReturn === 'start' && windowStart === 0) {
+    return {
+      ok: false,
+      code: 'zero-start',
+      field: 'plannedReturn',
+      error: 'The window starts at placement because the reference ranges overlap, so “Start of window” would mean no wait. Choose another option.',
+    };
+  }
+  const point = { none: null, start: windowStart, middle: (windowStart + windowEnd) / 2, end: windowEnd }[plannedReturn];
+  return {
+    ok: true,
+    plan: {
+      version: PLAN_VERSION,
+      start,
+      currentStage,
+      currentStageBasis: basis,
+      baselineAgeHours: [baseline[0], baseline[1]],
+      targetStage,
+      targetAgeHours: [t.minHours, t.maxHours],
+      windowHours: [windowStart, windowEnd],
+      rangesOverlap: rawStart < 0,
+      plannedReturn,
+      plannedReturnMinutes: point === null ? null : Math.round(point * 60),
+      referenceVersion: HH_REFERENCE.version,
+    },
+  };
+}
+
+export const BASIS_LABEL = {
+  'known-age': 'freshly set eggs (known age 0 h)',
+  selected: 'selected stage (not observed)',
+  observed: 'observed stage (morphologically confirmed)',
+  'entered-duration': 'entered incubation duration (converted)',
+};
+
+/** "7–16 h" / "3 h" / "0–5 h" (uses days above 72 h). */
+export function formatHoursRange([lo, hi]) {
+  const f = (h) => (hi > 72 ? `${+(h / 24).toFixed(2)}` : `${+h.toFixed(1)}`);
+  const unit = hi > 72 ? 'd' : 'h';
+  if (!Number.isFinite(lo) || !Number.isFinite(hi)) return '—';
+  return lo === hi ? `${f(lo)} ${unit}` : `${f(lo)}–${f(hi)} ${unit}`;
 }

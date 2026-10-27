@@ -47,7 +47,7 @@ export function renderDashboard(container, ctx) {
       : html`
         ${overdue.length
           ? html`<section aria-labelledby="h-overdue">
-              <h2 id="h-overdue" class="section-title danger">Overdue (${overdue.length})</h2>
+              <h2 id="h-overdue" class="section-title danger">Overdue or window passed (${overdue.length})</h2>
               <div class="card-grid">${overdue.map((r) => experimentCard(r, now))}</div>
             </section>`
           : ''}
